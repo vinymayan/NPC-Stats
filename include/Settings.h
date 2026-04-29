@@ -14,7 +14,9 @@
 #include "SKSEMCP/SKSEMenuFramework.hpp"
 #include "Manager.h"
 #include <miniz.h>
-
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
 namespace NSettings {
     void NPCMenu();
     void Presets();

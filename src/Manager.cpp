@@ -65,6 +65,7 @@ void Manager::PopulateAllLists() {
     PopulateList<RE::TESCombatStyle>("CombatStyle");
     PopulateList<RE::BGSPerk>("Perk");
     PopulateList<RE::TESFaction>("Faction");
+    PopulateList<RE::SpellItem>("Spell");
     _isPopulated = true;
     for (auto cb : _readyCallbacks) {
         if (cb) cb();
@@ -202,22 +203,34 @@ void Manager::UnregisterAffectedNPC(RE::FormID baseID) {
     _affectedNPCs.erase(baseID);
 }
 
-bool Manager::IsNPCAffected(RE::FormID baseID, std::string& outNifPath) {
+bool Manager::IsNPCAffected(RE::FormID baseID) {
     auto it = _affectedNPCs.find(baseID);
     if (it != _affectedNPCs.end()) {
-        outNifPath = it->second;
+
         return true;
     }
     return false;
 }
 
 void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::Document& doc) {
-    if (!a_npc) return;
+    if (!a_npc || !doc.IsObject()) return;
 
     // --- Atributos base ---
     if (doc.HasMember("health") && doc["health"].IsFloat()) a_npc->playerSkills.health = static_cast<std::uint16_t>(doc["health"].GetFloat());
     if (doc.HasMember("magicka") && doc["magicka"].IsFloat()) a_npc->playerSkills.magicka = static_cast<std::uint16_t>(doc["magicka"].GetFloat());
     if (doc.HasMember("stamina") && doc["stamina"].IsFloat()) a_npc->playerSkills.stamina = static_cast<std::uint16_t>(doc["stamina"].GetFloat());
+
+    // --- Offsets e Configurações (ACBS) ---
+    if (doc.HasMember("healthOffset") && doc["healthOffset"].IsInt()) a_npc->actorData.healthOffset = static_cast<std::int16_t>(doc["healthOffset"].GetInt());
+    if (doc.HasMember("magickaOffset") && doc["magickaOffset"].IsInt()) a_npc->actorData.magickaOffset = static_cast<std::int16_t>(doc["magickaOffset"].GetInt());
+    if (doc.HasMember("staminaOffset") && doc["staminaOffset"].IsInt()) a_npc->actorData.staminaOffset = static_cast<std::int16_t>(doc["staminaOffset"].GetInt());
+
+    if (doc.HasMember("calcMinLevel") && doc["calcMinLevel"].IsUint()) a_npc->actorData.calcLevelMin = static_cast<std::uint16_t>(doc["calcMinLevel"].GetUint());
+    if (doc.HasMember("calcMaxLevel") && doc["calcMaxLevel"].IsUint()) a_npc->actorData.calcLevelMax = static_cast<std::uint16_t>(doc["calcMaxLevel"].GetUint());
+    if (doc.HasMember("level") && doc["level"].IsUint()) a_npc->actorData.level = static_cast<std::uint16_t>(doc["level"].GetUint());
+    if (doc.HasMember("speedMult") && doc["speedMult"].IsUint()) a_npc->actorData.speedMult = static_cast<std::uint16_t>(doc["speedMult"].GetUint());
+    if (doc.HasMember("dispositionBase") && doc["dispositionBase"].IsUint()) a_npc->actorData.baseDisposition = static_cast<std::uint16_t>(doc["dispositionBase"].GetUint());
+    if (doc.HasMember("bleedoutOverride") && doc["bleedoutOverride"].IsInt()) a_npc->actorData.bleedoutOverride = static_cast<std::int16_t>(doc["bleedoutOverride"].GetInt());
 
     // --- Flags ---
     auto& flags = a_npc->actorData.actorBaseFlags;
@@ -225,7 +238,9 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::
     if (doc.HasMember("isProtected") && doc["isProtected"].IsBool()) { doc["isProtected"].GetBool() ? flags.set(RE::ACTOR_BASE_DATA::Flag::kProtected) : flags.reset(RE::ACTOR_BASE_DATA::Flag::kProtected); }
     if (doc.HasMember("isUnique") && doc["isUnique"].IsBool()) { doc["isUnique"].GetBool() ? flags.set(RE::ACTOR_BASE_DATA::Flag::kUnique) : flags.reset(RE::ACTOR_BASE_DATA::Flag::kUnique); }
     if (doc.HasMember("calcStats") && doc["calcStats"].IsBool()) { doc["calcStats"].GetBool() ? flags.set(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult) : flags.reset(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult); }
-
+    if (doc.HasMember("doesntAffectStealthMeter") && doc["doesntAffectStealthMeter"].IsBool()) {
+        doc["doesntAffectStealthMeter"].GetBool() ? flags.set(RE::ACTOR_BASE_DATA::Flag::kDoesntAffectStealthMeter) : flags.reset(RE::ACTOR_BASE_DATA::Flag::kDoesntAffectStealthMeter);
+    }
     // --- Forms ---
     if (doc.HasMember("class") && doc["class"].IsString()) {
         a_npc->npcClass = RE::TESForm::LookupByID<RE::TESClass>(FormUtil::FormIDFromString(doc["class"].GetString()));
@@ -234,11 +249,17 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::
         a_npc->combatStyle = RE::TESForm::LookupByID<RE::TESCombatStyle>(FormUtil::FormIDFromString(doc["combatStyle"].GetString()));
     }
 
-    // --- Skills ---
+    // --- Skills (Base e Offsets) ---
     if (doc.HasMember("skills") && doc["skills"].IsArray()) {
         auto arr = doc["skills"].GetArray();
         for (rapidjson::SizeType i = 0; i < arr.Size() && i < 18; i++) {
             a_npc->playerSkills.values[i] = static_cast<std::uint8_t>(arr[i].GetInt());
+        }
+    }
+    if (doc.HasMember("skillOffsets") && doc["skillOffsets"].IsArray()) {
+        auto arr = doc["skillOffsets"].GetArray();
+        for (rapidjson::SizeType i = 0; i < arr.Size() && i < 18; i++) {
+            a_npc->playerSkills.offsets[i] = static_cast<std::uint8_t>(arr[i].GetInt());
         }
     }
 
@@ -259,14 +280,12 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::
 
     // --- Perks ---
     if (doc.HasMember("perks") && doc["perks"].IsArray()) {
-        // Primeiro removemos todos os perks existentes para evitar duplicatas ao injetar o JSON
         std::vector<RE::BGSPerk*> toRemove;
         for (std::uint32_t i = 0; i < a_npc->perkCount; i++) {
             if (a_npc->perks && a_npc->perks[i].perk) toRemove.push_back(a_npc->perks[i].perk);
         }
         a_npc->RemovePerks(toRemove);
 
-        // Adicionamos os novos conforme o JSON
         for (auto& p : doc["perks"].GetArray()) {
             if (p.HasMember("form") && p.HasMember("rank")) {
                 if (auto perk = RE::TESForm::LookupByID<RE::BGSPerk>(FormUtil::FormIDFromString(p["form"].GetString()))) {
@@ -274,5 +293,93 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::
                 }
             }
         }
+    }
+
+    // --- Spells (Correção via TESSpellList / actorEffects) ---
+    if (doc.HasMember("spells") && doc["spells"].IsArray()) {
+        auto spellComp = static_cast<RE::TESSpellList*>(a_npc);
+
+        // Remove os feitiços existentes da base Vacnilla
+        if (spellComp->actorEffects) {
+            std::vector<RE::SpellItem*> toRemove;
+            for (std::uint32_t i = 0; i < spellComp->actorEffects->numSpells; i++) {
+                if (spellComp->actorEffects->spells && spellComp->actorEffects->spells[i]) {
+                    toRemove.push_back(spellComp->actorEffects->spells[i]);
+                }
+            }
+            for (auto* sp : toRemove) {
+                spellComp->actorEffects->RemoveSpell(sp);
+            }
+        }
+
+        auto spellArray = doc["spells"].GetArray();
+        if (spellArray.Size() > 0) {
+            if (!spellComp->actorEffects) {
+                spellComp->actorEffects = new RE::TESSpellList::SpellData();
+            }
+
+            for (auto& s : spellArray) {
+                if (auto sp = RE::TESForm::LookupByID<RE::SpellItem>(FormUtil::FormIDFromString(s.GetString()))) {
+                    spellComp->actorEffects->AddSpell(sp);
+                }
+            }
+        }
+    }
+}
+
+void Manager::ApplyActorCustomizationFromJSON(RE::Actor* a_actor, const rapidjson::Document& doc) {
+    if (!a_actor || !doc.IsObject()) return;
+    auto avOwner = a_actor->AsActorValueOwner();
+    if (!avOwner) return;
+
+    if (doc.HasMember("attackDamageMult") && doc["attackDamageMult"].IsFloat())
+        avOwner->SetActorValue(RE::ActorValue::kAttackDamageMult, doc["attackDamageMult"].GetFloat());
+    if (doc.HasMember("healRateMult") && doc["healRateMult"].IsFloat())
+        avOwner->SetActorValue(RE::ActorValue::kHealRateMult, doc["healRateMult"].GetFloat());
+    if (doc.HasMember("magickaRateMult") && doc["magickaRateMult"].IsFloat())
+        avOwner->SetActorValue(RE::ActorValue::kMagickaRateMult, doc["magickaRateMult"].GetFloat());
+    if (doc.HasMember("staminaRateMult") && doc["staminaRateMult"].IsFloat())
+        avOwner->SetActorValue(RE::ActorValue::kStaminaRateMult, doc["staminaRateMult"].GetFloat());
+}
+
+void Manager::LoadAndApplyActorCustomizations(RE::Actor* a_actor) {
+    if (!a_actor) return;
+    auto base = a_actor->GetActorBase();
+    if (!base) return;
+
+    std::string editorID = clib_util::editorID::get_editorID(base);
+    if (editorID.empty()) editorID = std::format("{:08X}", base->GetFormID());
+
+    std::string npcPath = std::format("Data/SKSE/Plugins/NPC Stats/NPC/{}.json", editorID);
+    if (!std::filesystem::exists(npcPath)) return;
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, npcPath.c_str(), "rb");
+    if (!fp) return;
+
+    char readBuffer[2048];
+    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+    rapidjson::Document doc;
+    doc.ParseStream(is);
+    fclose(fp);
+
+    if (!doc.IsObject()) return;
+
+    // Verifica se ele tem um preset lincado
+    if (doc.HasMember("preset") && doc["preset"].IsString()) {
+        std::string presetPath = std::format("Data/SKSE/Plugins/NPC Stats/Presets/{}.json", doc["preset"].GetString());
+        FILE* pFp = nullptr;
+        fopen_s(&pFp, presetPath.c_str(), "rb");
+        if (pFp) {
+            char pReadBuffer[2048];
+            rapidjson::FileReadStream pIs(pFp, pReadBuffer, sizeof(pReadBuffer));
+            rapidjson::Document pDoc;
+            pDoc.ParseStream(pIs);
+            fclose(pFp);
+            ApplyActorCustomizationFromJSON(a_actor, pDoc);
+        }
+    }
+    else {
+        ApplyActorCustomizationFromJSON(a_actor, doc);
     }
 }

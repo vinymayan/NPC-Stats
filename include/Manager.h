@@ -6,6 +6,10 @@
 #include <functional>
 #include "ClibUtil/editorID.hpp"
 #include "rapidjson/document.h"
+#include "rapidjson/filereadstream.h"
+#include "rapidjson/filewritestream.h"
+#include "rapidjson/prettywriter.h"
+#include "rapidjson/stringbuffer.h"
 #include <thread>
 #include <chrono>
 
@@ -44,7 +48,7 @@ public:
 
     void RegisterAffectedNPC(RE::FormID baseID, const std::string& nifPath);
     void UnregisterAffectedNPC(RE::FormID baseID);
-    bool IsNPCAffected(RE::FormID baseID, std::string& outNifPath);
+    bool IsNPCAffected(RE::FormID baseID);
 
     void PopulateAllLists();
     static std::string ToUTF8(std::string_view a_str);
@@ -55,7 +59,8 @@ public:
     // Register callback for when population is done
     void RegisterReadyCallback(std::function<void()> callback);
     static void ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::Document& doc);
-
+    static void ApplyActorCustomizationFromJSON(RE::Actor* a_actor, const rapidjson::Document& doc);
+    void LoadAndApplyActorCustomizations(RE::Actor* a_actor);
 private:
     Manager() = default;
 

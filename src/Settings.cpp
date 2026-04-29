@@ -5,6 +5,59 @@ const char* BasePath = "Data/SKSE/Plugins/NPC Stats";
 const char* NPCPath = "Data/SKSE/Plugins/NPC Stats/NPC";
 const char* PresetsPath = "Data/SKSE/Plugins/NPC Stats/Presets";
 
+namespace {
+    const std::string LOC_BASE_DIR = "Data/SKSE/Plugins/NPC Stats/";
+    const std::string LANG_PATH = LOC_BASE_DIR + "Language.json";
+
+    std::unordered_map<std::string, std::string> LangMap;
+
+    void LoadLanguage() {
+        LangMap.clear();
+        std::ifstream file(LANG_PATH, std::ios::binary);
+        if (!file.is_open()) {
+            logger::warn("[NPC Stats] Language.json not found. Using default texts.");
+            return;
+        }
+
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string jsonStr = buffer.str();
+        file.close();
+
+        // Remove BOM se existir
+        if (jsonStr.size() >= 3 && (unsigned char)jsonStr[0] == 0xEF &&
+            (unsigned char)jsonStr[1] == 0xBB && (unsigned char)jsonStr[2] == 0xBF) {
+            jsonStr.erase(0, 3);
+        }
+
+        rapidjson::Document doc;
+        doc.Parse(jsonStr.c_str());
+
+        if (doc.HasParseError()) return;
+
+        if (doc.IsObject()) {
+            for (auto itr = doc.MemberBegin(); itr != doc.MemberEnd(); ++itr) {
+                if (itr->value.IsObject()) {
+                    std::string category = itr->name.GetString();
+                    for (auto jtr = itr->value.MemberBegin(); jtr != itr->value.MemberEnd(); ++jtr) {
+                        if (jtr->value.IsString()) {
+                            LangMap[category + "." + jtr->name.GetString()] = jtr->value.GetString();
+                        }
+                    }
+                }
+                else if (itr->value.IsString()) {
+                    LangMap[itr->name.GetString()] = itr->value.GetString();
+                }
+            }
+        }
+    }
+
+    const char* GetLoc(const std::string& key, const char* defaultVal) {
+        auto it = LangMap.find(key);
+        if (it != LangMap.end()) return it->second.c_str();
+        return defaultVal;
+    }
+}
 // Variaveis de estado para a UI
 static RE::Actor* g_currentActor = nullptr;
 static RE::TESNPC* g_currentNPC = nullptr;
@@ -19,11 +72,31 @@ static float ui_health = 100.0f;
 static float ui_magicka = 100.0f;
 static float ui_stamina = 100.0f;
 
+static int ui_healthOffset = 0;
+static int ui_magickaOffset = 0;
+static int ui_staminaOffset = 0;
+
+static uint16_t ui_calcMinLevel = 1;
+static uint16_t ui_calcMaxLevel = 999;
+static float ui_levelMult = 1.0f;
+static uint16_t ui_level = 1;
+
+static uint16_t ui_speedMult = 100;
+static uint16_t ui_dispositionBase = 35;
+static int ui_bleedoutOverride = 0;
+
 // Flags
 static bool ui_isEssential = false;
 static bool ui_isProtected = false;
 static bool ui_isUnique = false;
 static bool ui_calcStats = false;
+static bool ui_doesntAffectStealthMeter = false;
+
+// Multiplicadores (Actor Values Instanciados)
+static float ui_attackDamageMult = 1.0f;
+static float ui_healRateMult = 100.0f;
+static float ui_magickaRateMult = 100.0f;
+static float ui_staminaRateMult = 100.0f;
 
 // Form Refs
 static RE::TESClass* ui_class = nullptr;
@@ -31,6 +104,7 @@ static RE::TESCombatStyle* ui_combatStyle = nullptr;
 
 // Skills
 static uint8_t ui_skills[18] = { 15 };
+static uint8_t ui_skillOffsets[18] = { 0 };
 static const char* skillNames[18] = {
     "One-Handed", "Two-Handed", "Archery", "Block", "Smithing", "Heavy Armor",
     "Light Armor", "Pickpocket", "Lockpicking", "Sneak", "Alchemy", "Speech",
@@ -48,7 +122,7 @@ struct UIFaction {
 };
 static std::vector<UIPerk> ui_perks;
 static std::vector<UIFaction> ui_factions;
-
+static std::vector<RE::SpellItem*> ui_spells;
 // Backups e Engine States
 static rapidjson::Document originalEngineState;
 static std::map<RE::FormID, std::string> g_vanillaNPCStates;
@@ -68,20 +142,47 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     doc.AddMember("magicka", static_cast<float>(npc->playerSkills.magicka), allocator);
     doc.AddMember("stamina", static_cast<float>(npc->playerSkills.stamina), allocator);
 
+    doc.AddMember("healthOffset", static_cast<int>(npc->actorData.healthOffset), allocator);
+    doc.AddMember("magickaOffset", static_cast<int>(npc->actorData.magickaOffset), allocator);
+    doc.AddMember("staminaOffset", static_cast<int>(npc->actorData.staminaOffset), allocator);
+
+    doc.AddMember("calcMinLevel", npc->actorData.calcLevelMin, allocator);
+    doc.AddMember("calcMaxLevel", npc->actorData.calcLevelMax, allocator);
+    doc.AddMember("level", npc->actorData.level, allocator);
+    doc.AddMember("speedMult", npc->actorData.speedMult, allocator);
+    doc.AddMember("dispositionBase", npc->actorData.baseDisposition, allocator);
+    doc.AddMember("bleedoutOverride", npc->actorData.bleedoutOverride, allocator);
+
     auto flags = npc->actorData.actorBaseFlags;
     doc.AddMember("isEssential", flags.all(RE::ACTOR_BASE_DATA::Flag::kEssential), allocator);
     doc.AddMember("isProtected", flags.all(RE::ACTOR_BASE_DATA::Flag::kProtected), allocator);
     doc.AddMember("isUnique", flags.all(RE::ACTOR_BASE_DATA::Flag::kUnique), allocator);
     doc.AddMember("calcStats", flags.all(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult), allocator);
-
+    doc.AddMember("doesntAffectStealthMeter", flags.all(RE::ACTOR_BASE_DATA::Flag::kDoesntAffectStealthMeter), allocator); 
+    float atkMult = 1.0f, healMult = 100.0f, magMult = 100.0f, stamMult = 100.0f;
+    if (g_currentActor && g_currentActor->GetActorBase() == npc) {
+        if (auto avOwner = g_currentActor->AsActorValueOwner()) {
+            atkMult = avOwner->GetActorValue(RE::ActorValue::kAttackDamageMult);
+            healMult = avOwner->GetActorValue(RE::ActorValue::kHealRateMult);
+            magMult = avOwner->GetActorValue(RE::ActorValue::kMagickaRateMult);
+            stamMult = avOwner->GetActorValue(RE::ActorValue::kStaminaRateMult);
+        }
+    }
+    doc.AddMember("attackDamageMult", atkMult, allocator);
+    doc.AddMember("healRateMult", healMult, allocator);
+    doc.AddMember("magickaRateMult", magMult, allocator);
+    doc.AddMember("staminaRateMult", stamMult, allocator);
     if (npc->npcClass) doc.AddMember("class", rapidjson::Value(FormUtil::NormalizeFormID(npc->npcClass).c_str(), allocator), allocator);
     if (npc->combatStyle) doc.AddMember("combatStyle", rapidjson::Value(FormUtil::NormalizeFormID(npc->combatStyle).c_str(), allocator), allocator);
 
     rapidjson::Value skillsArray(rapidjson::kArrayType);
+    rapidjson::Value skillOffArray(rapidjson::kArrayType);
     for (int i = 0; i < 18; i++) {
         skillsArray.PushBack(npc->playerSkills.values[i], allocator);
+        skillOffArray.PushBack(npc->playerSkills.offsets[i], allocator);
     }
     doc.AddMember("skills", skillsArray, allocator);
+    doc.AddMember("skillOffsets", skillOffArray, allocator);
 
     rapidjson::Value perkArray(rapidjson::kArrayType);
     for (std::uint32_t i = 0; i < npc->perkCount; i++) {
@@ -105,6 +206,16 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     }
     doc.AddMember("factions", factionArray, allocator);
 
+    rapidjson::Value spellArray(rapidjson::kArrayType);
+    if (auto spellList = npc->GetSpellList()) {
+        for (std::uint32_t i = 0; i < spellList->numSpells; i++) {
+            if (spellList->spells && spellList->spells[i]) {
+                spellArray.PushBack(rapidjson::Value(FormUtil::NormalizeFormID(spellList->spells[i]).c_str(), allocator), allocator);
+            }
+        }
+    }
+    doc.AddMember("spells", spellArray, allocator);
+
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
@@ -119,19 +230,40 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     doc.AddMember("magicka", ui_magicka, allocator);
     doc.AddMember("stamina", ui_stamina, allocator);
 
+    doc.AddMember("healthOffset", ui_healthOffset, allocator);
+    doc.AddMember("magickaOffset", ui_magickaOffset, allocator);
+    doc.AddMember("staminaOffset", ui_staminaOffset, allocator);
+
+    doc.AddMember("calcMinLevel", ui_calcMinLevel, allocator);
+    doc.AddMember("calcMaxLevel", ui_calcMaxLevel, allocator);
+    if (ui_calcStats) doc.AddMember("level", static_cast<uint16_t>(ui_levelMult * 1000.0f), allocator);
+    else doc.AddMember("level", ui_level, allocator);
+
+    doc.AddMember("speedMult", ui_speedMult, allocator);
+    doc.AddMember("dispositionBase", ui_dispositionBase, allocator);
+    doc.AddMember("bleedoutOverride", ui_bleedoutOverride, allocator);
+
     doc.AddMember("isEssential", ui_isEssential, allocator);
     doc.AddMember("isProtected", ui_isProtected, allocator);
     doc.AddMember("isUnique", ui_isUnique, allocator);
     doc.AddMember("calcStats", ui_calcStats, allocator);
+    doc.AddMember("doesntAffectStealthMeter", ui_doesntAffectStealthMeter, allocator);
+    doc.AddMember("attackDamageMult", ui_attackDamageMult, allocator);
+    doc.AddMember("healRateMult", ui_healRateMult, allocator);
+    doc.AddMember("magickaRateMult", ui_magickaRateMult, allocator);
+    doc.AddMember("staminaRateMult", ui_staminaRateMult, allocator);
 
     if (ui_class) doc.AddMember("class", rapidjson::Value(FormUtil::NormalizeFormID(ui_class).c_str(), allocator), allocator);
     if (ui_combatStyle) doc.AddMember("combatStyle", rapidjson::Value(FormUtil::NormalizeFormID(ui_combatStyle).c_str(), allocator), allocator);
 
     rapidjson::Value skillsArray(rapidjson::kArrayType);
+    rapidjson::Value skillOffArray(rapidjson::kArrayType);
     for (int i = 0; i < 18; i++) {
         skillsArray.PushBack(ui_skills[i], allocator);
+        skillOffArray.PushBack(ui_skillOffsets[i], allocator);
     }
     doc.AddMember("skills", skillsArray, allocator);
+    doc.AddMember("skillOffsets", skillOffArray, allocator);
 
     rapidjson::Value perkArray(rapidjson::kArrayType);
     for (const auto& p : ui_perks) {
@@ -154,6 +286,12 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
         }
     }
     doc.AddMember("factions", factionArray, allocator);
+
+    rapidjson::Value spellArray(rapidjson::kArrayType);
+    for (auto* sp : ui_spells) {
+        if (sp) spellArray.PushBack(rapidjson::Value(FormUtil::NormalizeFormID(sp).c_str(), allocator), allocator);
+    }
+    doc.AddMember("spells", spellArray, allocator);
 }
 
 void ParseJSONToUI(const rapidjson::Document& j) {
@@ -161,24 +299,47 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     ui_combatStyle = nullptr;
     ui_perks.clear();
     ui_factions.clear();
+    ui_spells.clear();
 
     if (j.HasMember("health") && j["health"].IsFloat()) ui_health = j["health"].GetFloat();
     if (j.HasMember("magicka") && j["magicka"].IsFloat()) ui_magicka = j["magicka"].GetFloat();
     if (j.HasMember("stamina") && j["stamina"].IsFloat()) ui_stamina = j["stamina"].GetFloat();
 
+    if (j.HasMember("healthOffset") && j["healthOffset"].IsInt()) ui_healthOffset = j["healthOffset"].GetInt();
+    if (j.HasMember("magickaOffset") && j["magickaOffset"].IsInt()) ui_magickaOffset = j["magickaOffset"].GetInt();
+    if (j.HasMember("staminaOffset") && j["staminaOffset"].IsInt()) ui_staminaOffset = j["staminaOffset"].GetInt();
+
+    if (j.HasMember("calcMinLevel") && j["calcMinLevel"].IsUint()) ui_calcMinLevel = static_cast<uint16_t>(j["calcMinLevel"].GetUint());
+    if (j.HasMember("calcMaxLevel") && j["calcMaxLevel"].IsUint()) ui_calcMaxLevel = static_cast<uint16_t>(j["calcMaxLevel"].GetUint());
+    if (j.HasMember("speedMult") && j["speedMult"].IsUint()) ui_speedMult = static_cast<uint16_t>(j["speedMult"].GetUint());
+    if (j.HasMember("dispositionBase") && j["dispositionBase"].IsUint()) ui_dispositionBase = static_cast<uint16_t>(j["dispositionBase"].GetUint());
+    if (j.HasMember("bleedoutOverride") && j["bleedoutOverride"].IsInt()) ui_bleedoutOverride = j["bleedoutOverride"].GetInt();
+
     if (j.HasMember("isEssential") && j["isEssential"].IsBool()) ui_isEssential = j["isEssential"].GetBool();
     if (j.HasMember("isProtected") && j["isProtected"].IsBool()) ui_isProtected = j["isProtected"].GetBool();
     if (j.HasMember("isUnique") && j["isUnique"].IsBool()) ui_isUnique = j["isUnique"].GetBool();
     if (j.HasMember("calcStats") && j["calcStats"].IsBool()) ui_calcStats = j["calcStats"].GetBool();
+    if (j.HasMember("doesntAffectStealthMeter") && j["doesntAffectStealthMeter"].IsBool()) ui_doesntAffectStealthMeter = j["doesntAffectStealthMeter"].GetBool(); 
+    if (j.HasMember("attackDamageMult") && j["attackDamageMult"].IsFloat()) ui_attackDamageMult = j["attackDamageMult"].GetFloat();
+    if (j.HasMember("healRateMult") && j["healRateMult"].IsFloat()) ui_healRateMult = j["healRateMult"].GetFloat();
+    if (j.HasMember("magickaRateMult") && j["magickaRateMult"].IsFloat()) ui_magickaRateMult = j["magickaRateMult"].GetFloat();
+    if (j.HasMember("staminaRateMult") && j["staminaRateMult"].IsFloat()) ui_staminaRateMult = j["staminaRateMult"].GetFloat();
+    if (j.HasMember("level") && j["level"].IsUint()) {
+        uint16_t lvl = static_cast<uint16_t>(j["level"].GetUint());
+        if (ui_calcStats) ui_levelMult = lvl / 1000.0f;
+        else ui_level = lvl;
+    }
 
     if (j.HasMember("class")) ui_class = RE::TESForm::LookupByID<RE::TESClass>(FormUtil::FormIDFromString(j["class"].GetString()));
     if (j.HasMember("combatStyle")) ui_combatStyle = RE::TESForm::LookupByID<RE::TESCombatStyle>(FormUtil::FormIDFromString(j["combatStyle"].GetString()));
 
     if (j.HasMember("skills") && j["skills"].IsArray()) {
         auto sArray = j["skills"].GetArray();
-        for (rapidjson::SizeType i = 0; i < sArray.Size() && i < 18; i++) {
-            ui_skills[i] = static_cast<uint8_t>(sArray[i].GetInt());
-        }
+        for (rapidjson::SizeType i = 0; i < sArray.Size() && i < 18; i++) ui_skills[i] = static_cast<uint8_t>(sArray[i].GetInt());
+    }
+    if (j.HasMember("skillOffsets") && j["skillOffsets"].IsArray()) {
+        auto sArray = j["skillOffsets"].GetArray();
+        for (rapidjson::SizeType i = 0; i < sArray.Size() && i < 18; i++) ui_skillOffsets[i] = static_cast<uint8_t>(sArray[i].GetInt());
     }
 
     if (j.HasMember("perks") && j["perks"].IsArray()) {
@@ -200,6 +361,15 @@ void ParseJSONToUI(const rapidjson::Document& j) {
             }
         }
     }
+
+    if (j.HasMember("spells") && j["spells"].IsArray()) {
+        for (auto& s : j["spells"].GetArray()) {
+            if (auto sp = RE::TESForm::LookupByID<RE::SpellItem>(FormUtil::FormIDFromString(s.GetString()))) {
+                ui_spells.push_back(sp);
+            }
+        }
+    }
+
 }
 
 void UpdateLastSavedState() {
@@ -306,7 +476,7 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
     std::vector<const char*> comboItems;
     std::vector<int> mapToFull;
 
-    comboItems.push_back("None");
+    comboItems.push_back(GetLoc("text.none", "None"));
     mapToFull.push_back(-1);
 
     for (size_t i = 0; i < fullList.size(); ++i) {
@@ -334,11 +504,11 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
     ImGuiMCP::SameLine();
 
     if (disabled) {
-        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "[LOCKED] %s", comboItems.empty() ? "None" : comboItems[localSelection]);
+        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s %s", GetLoc("text.locked", "[LOCKED]"), comboItems.empty() ? GetLoc("text.none", "None") : comboItems[localSelection]);
     }
     else {
         if (customWidth > 0.0f) ImGuiMCP::SetNextItemWidth(customWidth);
-        const char* previewValue = comboItems.empty() ? "None" : comboItems[localSelection];
+        const char* previewValue = comboItems.empty() ? GetLoc("text.none", "None") : comboItems[localSelection];
 
         if (ImGuiMCP::BeginCombo("##drop", previewValue)) {
             static std::map<std::string, std::string> searchBuffers;
@@ -378,6 +548,7 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
     }
     ImGuiMCP::PopID();
 }
+
 
 // ==========================================
 // CARREGAMENTO E APLICAÇÃO
@@ -426,37 +597,66 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     activePresetName = "";
     ui_linkedPreset = "";
 
-    // Extrai Base e Flags
+    // Extrai Base e Offsets
     ui_health = static_cast<float>(g_currentNPC->playerSkills.health);
     ui_magicka = static_cast<float>(g_currentNPC->playerSkills.magicka);
     ui_stamina = static_cast<float>(g_currentNPC->playerSkills.stamina);
+
+    ui_healthOffset = g_currentNPC->actorData.healthOffset;
+    ui_magickaOffset = g_currentNPC->actorData.magickaOffset;
+    ui_staminaOffset = g_currentNPC->actorData.staminaOffset;
+
+    ui_calcMinLevel = g_currentNPC->actorData.calcLevelMin;
+    ui_calcMaxLevel = g_currentNPC->actorData.calcLevelMax;
+    ui_speedMult = g_currentNPC->actorData.speedMult;
+    ui_dispositionBase = g_currentNPC->actorData.baseDisposition;
+    ui_bleedoutOverride = g_currentNPC->actorData.bleedoutOverride;
 
     auto flags = g_currentNPC->actorData.actorBaseFlags;
     ui_isEssential = flags.all(RE::ACTOR_BASE_DATA::Flag::kEssential);
     ui_isProtected = flags.all(RE::ACTOR_BASE_DATA::Flag::kProtected);
     ui_isUnique = flags.all(RE::ACTOR_BASE_DATA::Flag::kUnique);
     ui_calcStats = flags.all(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult);
+    ui_doesntAffectStealthMeter = flags.all(RE::ACTOR_BASE_DATA::Flag::kDoesntAffectStealthMeter);
+    if (ui_calcStats) ui_levelMult = g_currentNPC->actorData.level / 1000.0f;
+    else ui_level = g_currentNPC->actorData.level;
 
     ui_class = g_currentNPC->npcClass;
     ui_combatStyle = g_currentNPC->combatStyle;
 
-    for (int i = 0; i < 18; i++) {
-        ui_skills[i] = g_currentNPC->playerSkills.values[i];
-    }
+    ui_attackDamageMult = 1.0f; 
+    ui_healRateMult = 100.0f; 
+    ui_magickaRateMult = 100.0f; 
+    ui_staminaRateMult = 100.0f;
 
-    // Carrega Perks para a UI
-    ui_perks.clear();
-    for (std::uint32_t i = 0; i < g_currentNPC->perkCount; i++) {
-        if (g_currentNPC->perks && g_currentNPC->perks[i].perk) {
-            ui_perks.push_back({ g_currentNPC->perks[i].perk, g_currentNPC->perks[i].currentRank });
+    if (g_currentActor) {
+        if (auto avOwner = g_currentActor->AsActorValueOwner()) {
+            ui_attackDamageMult = avOwner->GetActorValue(RE::ActorValue::kAttackDamageMult);
+            ui_healRateMult = avOwner->GetActorValue(RE::ActorValue::kHealRateMult);
+            ui_magickaRateMult = avOwner->GetActorValue(RE::ActorValue::kMagickaRateMult);
+            ui_staminaRateMult = avOwner->GetActorValue(RE::ActorValue::kStaminaRateMult);
         }
     }
 
-    // Carrega Factions para a UI
+    for (int i = 0; i < 18; i++) {
+        ui_skills[i] = g_currentNPC->playerSkills.values[i];
+        ui_skillOffsets[i] = g_currentNPC->playerSkills.offsets[i];
+    }
+
+    ui_perks.clear();
+    for (std::uint32_t i = 0; i < g_currentNPC->perkCount; i++) {
+        if (g_currentNPC->perks && g_currentNPC->perks[i].perk) ui_perks.push_back({ g_currentNPC->perks[i].perk, g_currentNPC->perks[i].currentRank });
+    }
+
     ui_factions.clear();
     for (auto& f : g_currentNPC->factions) {
-        if (f.faction) {
-            ui_factions.push_back({ f.faction, f.rank });
+        if (f.faction) ui_factions.push_back({ f.faction, f.rank });
+    }
+
+    ui_spells.clear();
+    if (auto spellList = g_currentNPC->GetSpellList()) {
+        for (std::uint32_t i = 0; i < spellList->numSpells; i++) {
+            if (spellList->spells && spellList->spells[i]) ui_spells.push_back(spellList->spells[i]);
         }
     }
 
@@ -479,8 +679,6 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
             if (doc.IsObject()) {
                 if (doc.HasMember("preset") && doc["preset"].IsString()) {
                     ui_linkedPreset = doc["preset"].GetString();
-
-                    // Carrega os dados reais do preset na UI para evitar tela desatualizada
                     std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
                     FILE* pFp = nullptr;
                     fopen_s(&pFp, pPath.c_str(), "rb");
@@ -494,7 +692,6 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
                     }
                 }
                 else {
-                    // Carrega as edições customizadas únicas desse NPC
                     ParseJSONToUI(doc);
                 }
             }
@@ -502,7 +699,6 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     }
     UpdateLastSavedState();
 }
-
 void SaveData() {
     rapidjson::Document doc;
     auto& allocator = doc.GetAllocator();
@@ -599,7 +795,10 @@ void ApplyNPC() {
             avOwner->SetBaseActorValue(RE::ActorValue::kHealth, ui_health);
             avOwner->SetBaseActorValue(RE::ActorValue::kMagicka, ui_magicka);
             avOwner->SetBaseActorValue(RE::ActorValue::kStamina, ui_stamina);
-
+            avOwner->SetActorValue(RE::ActorValue::kAttackDamageMult, ui_attackDamageMult);
+            avOwner->SetActorValue(RE::ActorValue::kHealRateMult, ui_healRateMult);
+            avOwner->SetActorValue(RE::ActorValue::kMagickaRateMult, ui_magickaRateMult);
+            avOwner->SetActorValue(RE::ActorValue::kStaminaRateMult, ui_staminaRateMult);
             // Aplica o valor de cada uma das 18 Skills no ator em cena
             // No Skyrim as ActorValues de skills são contínuas do ID 16 (OneHanded) até 33 (Enchanting)
             const RE::ActorValue SkillToActorValue[18] = {
@@ -649,6 +848,7 @@ void RestoreDefaultNPC() {
 }
 
 
+
 // ==========================================
 // MENUS UI PRINCIPAIS
 // ==========================================
@@ -656,28 +856,24 @@ void DrawMainEditorUI() {
     bool isLocked = (!ui_linkedPreset.empty() && !isEditingPreset);
     bool isDirty = HasUnsavedChanges();
 
-    if (!isEditingPreset && ImGuiMCP::Button("Apply in-game")) { ApplyNPC(); }
+    if (!isEditingPreset && ImGuiMCP::Button(GetLoc("btn.apply", "Apply in-game"))) { ApplyNPC(); }
     ImGuiMCP::SameLine();
-
     if (isDirty) ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.6f, 0.4f, 0.1f, 1.0f });
-    if (ImGuiMCP::Button("Save data")) { SaveData(); }
+    if (ImGuiMCP::Button(GetLoc("btn.save", "Save data"))) { SaveData(); }
     if (isDirty) ImGuiMCP::PopStyleColor();
 
     if (!isEditingPreset) {
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Undo Changes")) { RevertNPC(); }
+        if (ImGuiMCP::Button(GetLoc("btn.undo", "Undo Changes"))) { RevertNPC(); }
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Restore Default")) { RestoreDefaultNPC(); }
-
+        if (ImGuiMCP::Button(GetLoc("btn.restore", "Restore Default"))) { RestoreDefaultNPC(); }
         if (g_currentNPC) {
             std::string edid = clib_util::editorID::get_editorID(g_currentNPC);
             if (edid.empty()) edid = std::format("{:08X}", g_currentNPC->GetFormID());
             if (std::filesystem::exists(std::format("{}/{}.json", NPCPath, edid))) {
                 ImGuiMCP::SameLine();
-                if (isDirty) ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
-                else {
-                    if (ImGuiMCP::Button("Export")) ExportNPCAsZip(g_currentNPC, ui_linkedPreset);
-                }
+                if (isDirty) ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "%s", GetLoc("text.save_to_export", "[Save to Export]"));
+                else { if (ImGuiMCP::Button(GetLoc("btn.export", "Export"))) ExportNPCAsZip(g_currentNPC, ui_linkedPreset); }
             }
         }
     }
@@ -685,17 +881,17 @@ void DrawMainEditorUI() {
         std::string presetPath = std::format("{}/{}.json", PresetsPath, activePresetName);
         if (std::filesystem::exists(presetPath)) {
             ImGuiMCP::SameLine();
-            if (isDirty) ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
-            else if (ImGuiMCP::Button("Export")) ExportPresetAsZip(activePresetName);
+            if (isDirty) ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "%s", GetLoc("text.save_to_export", "[Save to Export]"));
+            else if (ImGuiMCP::Button(GetLoc("btn.export", "Export"))) ExportPresetAsZip(activePresetName);
         }
     }
     ImGuiMCP::Separator();
 
     if (isLocked) {
-        ImGuiMCP::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "This NPC is locked and using PRESET: %s", ui_linkedPreset.c_str());
-        if (ImGuiMCP::Button("Unlink Preset (Free Edit)")) ui_linkedPreset = "";
+        ImGuiMCP::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, GetLoc("text.locked_preset", "This NPC is locked and using PRESET: %s"), ui_linkedPreset.c_str());
+        if (ImGuiMCP::Button(GetLoc("btn.unlink", "Unlink Preset (Free Edit)"))) ui_linkedPreset = "";
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Edit this Preset")) LoadPresetToUI(ui_linkedPreset);
+        if (ImGuiMCP::Button(GetLoc("btn.edit_preset", "Edit this Preset"))) LoadPresetToUI(ui_linkedPreset);
         ImGuiMCP::Separator();
     }
     else if (!isEditingPreset) {
@@ -704,9 +900,9 @@ void DrawMainEditorUI() {
         static bool nameExistsError = false;
 
         ImGuiMCP::SetNextItemWidth(250.0f);
-        ImGuiMCP::InputText("New Preset Name", newPresetName, sizeof(newPresetName));
+        ImGuiMCP::InputText(GetLoc("ui.new_preset", "New Preset Name"), newPresetName, sizeof(newPresetName));
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Save as Preset")) {
+        if (ImGuiMCP::Button(GetLoc("btn.save_preset", "Save as Preset"))) {
             if (strlen(newPresetName) > 0) {
                 std::string newName(newPresetName);
                 if (std::find(ui_availablePresets.begin(), ui_availablePresets.end(), newName) != ui_availablePresets.end()) {
@@ -732,17 +928,17 @@ void DrawMainEditorUI() {
                 }
             }
         }
-        if (nameExistsError) ImGuiMCP::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "Error: A Preset with this name already exists!");
+        if (nameExistsError) ImGuiMCP::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "%s", GetLoc("text.preset_exists", "Error: A Preset with this name already exists!"));
 
         if (!ui_availablePresets.empty()) {
-            ImGuiMCP::Text("Apply Existing Preset:"); ImGuiMCP::SameLine();
+            ImGuiMCP::Text("%s", GetLoc("text.apply_existing", "Apply Existing Preset:")); ImGuiMCP::SameLine();
             static int s_presetIdx = 0;
             std::vector<const char*> presetCStrs;
             for (const auto& p : ui_availablePresets) presetCStrs.push_back(p.c_str());
             ImGuiMCP::SetNextItemWidth(200.0f);
             ImGuiMCP::Combo("##PresetCombo", &s_presetIdx, presetCStrs.data(), static_cast<int>(presetCStrs.size()));
             ImGuiMCP::SameLine();
-            if (ImGuiMCP::Button("Apply")) {
+            if (ImGuiMCP::Button(GetLoc("btn.apply_preset", "Apply"))) {
                 ui_linkedPreset = ui_availablePresets[s_presetIdx];
                 std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
                 FILE* fp = nullptr;
@@ -763,57 +959,136 @@ void DrawMainEditorUI() {
     }
 
     // --- PAINEL DE ATRIBUTOS BASE ---
-    ImGuiMCP::Text("Base Attributes");
-    if (isLocked) {
-        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "[LOCKED]");
-    }
+    ImGuiMCP::Text("%s", GetLoc("text.base_attr", "Base Attributes & Offsets"));
+    if (isLocked) ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.locked", "[LOCKED]"));
     else {
-        ImGuiMCP::SetNextItemWidth(250.0f);
-        // Alterado de SliderFloat para InputFloat
-        ImGuiMCP::InputFloat("Health", &ui_health, 1.0f, 10.0f, "%.0f");
-        ImGuiMCP::SetNextItemWidth(250.0f);
-        ImGuiMCP::InputFloat("Magicka", &ui_magicka, 1.0f, 10.0f, "%.0f");
-        ImGuiMCP::SetNextItemWidth(250.0f);
-        ImGuiMCP::InputFloat("Stamina", &ui_stamina, 1.0f, 10.0f, "%.0f");
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.health", "Health"), &ui_health, 1.0f, 10.0f, "%.0f");
+        ImGuiMCP::SameLine();
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputInt(GetLoc("ui.health_offset", "Health Offset"), &ui_healthOffset, 1, 10);
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.magicka", "Magicka"), &ui_magicka, 1.0f, 10.0f, "%.0f");
+        ImGuiMCP::SameLine();
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputInt(GetLoc("ui.magicka_offset", "Magicka Offset"), &ui_magickaOffset, 1, 10);
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.stamina", "Stamina"), &ui_stamina, 1.0f, 10.0f, "%.0f");
+        ImGuiMCP::SameLine();
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputInt(GetLoc("ui.stamina_offset", "Stamina Offset"), &ui_staminaOffset, 1, 10);
 
         ImGuiMCP::Spacing();
-        ImGuiMCP::Text("Base Flags");
-        ImGuiMCP::Checkbox("Essential", &ui_isEssential);
+        ImGuiMCP::Text("%s", GetLoc("text.acbs", "Level & Configuration (ACBS)"));
+
+        ImGuiMCP::Checkbox(GetLoc("ui.auto_calc", "Auto-Calc Stats"), &ui_calcStats);
         ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox("Protected", &ui_isProtected);
+        if (ui_calcStats) {
+            ImGuiMCP::SetNextItemWidth(200.0f);
+            ImGuiMCP::InputFloat(GetLoc("ui.level_mult", "Level Mult"), &ui_levelMult, 0.05f, 0.1f, "%.3f");
+        }
+        else {
+            ImGuiMCP::SetNextItemWidth(200.0f);
+            int lvl = ui_level;
+            if (ImGuiMCP::InputInt(GetLoc("ui.level", "Level"), &lvl)) ui_level = static_cast<uint16_t>(std::max(1, lvl));
+        }
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        int cMin = ui_calcMinLevel;
+        if (ImGuiMCP::InputInt(GetLoc("ui.calc_min", "Calc Min Level"), &cMin)) ui_calcMinLevel = static_cast<uint16_t>(std::max(0, cMin));
         ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox("Unique", &ui_isUnique);
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        int cMax = ui_calcMaxLevel;
+        if (ImGuiMCP::InputInt(GetLoc("ui.calc_max", "Calc Max Level"), &cMax)) ui_calcMaxLevel = static_cast<uint16_t>(std::max(0, cMax));
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        int spd = ui_speedMult;
+        if (ImGuiMCP::InputInt(GetLoc("ui.speed_mult", "Speed Multiplier"), &spd)) ui_speedMult = static_cast<uint16_t>(std::max(0, spd));
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        int disp = ui_dispositionBase;
+        if (ImGuiMCP::InputInt(GetLoc("ui.disposition", "Disposition Base"), &disp)) ui_dispositionBase = static_cast<uint16_t>(std::max(0, disp));
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputInt(GetLoc("ui.bleedout", "Bleedout Override"), &ui_bleedoutOverride, 1);
+
+        ImGuiMCP::Spacing();
+        ImGuiMCP::Text("%s", GetLoc("text.base_flags", "Base Flags"));
+        ImGuiMCP::Checkbox(GetLoc("ui.essential", "Essential"), &ui_isEssential);
         ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox("Auto-Calc Stats", &ui_calcStats);
+        ImGuiMCP::Checkbox(GetLoc("ui.protected", "Protected"), &ui_isProtected);
+        ImGuiMCP::SameLine();
+        ImGuiMCP::Checkbox(GetLoc("ui.unique", "Unique"), &ui_isUnique);
+        ImGuiMCP::SameLine();
+        ImGuiMCP::Checkbox(GetLoc("ui.stealth_meter", "Doesn't affect stealth meter"), &ui_doesntAffectStealthMeter);
+    }
+    ImGuiMCP::Separator();
+    ImGuiMCP::Spacing();
+    ImGuiMCP::Text("%s", GetLoc("text.multipliers", "Actor Multipliers (Instance Values)"));
+    if (isLocked) {
+        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.locked", "[LOCKED]"));
+    }
+    else {
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.atk_dmg_mult", "Attack Damage Mult"), &ui_attackDamageMult, 0.1f, 1.0f, "%.2f");
+        ImGuiMCP::SameLine();
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.heal_rate_mult", "Heal Rate Mult"), &ui_healRateMult, 1.0f, 10.0f, "%.2f");
+
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.mag_rate_mult", "Magicka Rate Mult"), &ui_magickaRateMult, 1.0f, 10.0f, "%.2f");
+        ImGuiMCP::SameLine();
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.stam_rate_mult", "Stamina Rate Mult"), &ui_staminaRateMult, 1.0f, 10.0f, "%.2f");
     }
     ImGuiMCP::Separator();
 
     // --- PAINEL DE CLASSE E COMBATE ---
-    ImGuiMCP::Text("Class & Combat Style");
+    ImGuiMCP::Text("%s", GetLoc("text.class_combat", "Class & Combat Style"));
     static int s_classIdx = 0, s_combatIdx = 0;
-    DrawDropdown("Class", "Class", &ui_class, s_classIdx, isLocked, 300.0f);
-    DrawDropdown("Combat Style", "CombatStyle", &ui_combatStyle, s_combatIdx, isLocked, 300.0f);
+    DrawDropdown(GetLoc("ui.class", "Class"), "Class", &ui_class, s_classIdx, isLocked, 300.0f);
+    DrawDropdown(GetLoc("ui.combat_style", "Combat Style"), "CombatStyle", &ui_combatStyle, s_combatIdx, isLocked, 300.0f);
     ImGuiMCP::Separator();
 
-    // --- PAINEL DE SKILLS ---
-    ImGuiMCP::Text("Skills (Base Offsets)");
+    // --- PAINEL DE SKILLS E OFFSETS ---
+    ImGuiMCP::Text("%s", GetLoc("text.skills", "Skills (Base & Offsets)"));
     if (ImGuiMCP::BeginTable("SkillsTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg)) {
+        ImGuiMCP::TableSetupColumn(GetLoc("col.skill", "Skill"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.value", "Value"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.offset", "Offset"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGuiMCP::TableHeadersRow();
+
         for (int i = 0; i < 18; i++) {
-            ImGuiMCP::TableNextColumn();
+            ImGuiMCP::TableNextRow();
+            ImGuiMCP::TableSetColumnIndex(0);
+            ImGuiMCP::Text("%s", skillNames[i]);
+
+            ImGuiMCP::TableSetColumnIndex(1);
             ImGuiMCP::PushID(i);
-            ImGuiMCP::SetNextItemWidth(120.0f);
-            if (isLocked) {
-                ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s: %d", skillNames[i], ui_skills[i]);
-            }
+            if (isLocked) ImGuiMCP::Text("%d", ui_skills[i]);
             else {
                 int skillVal = ui_skills[i];
-                // Alterado de SliderInt para InputInt
                 ImGuiMCP::SetNextItemWidth(200.0f);
-                if (ImGuiMCP::InputInt(skillNames[i], &skillVal, 1, 5)) {
-                    // Evita valores menores que 0 ou maiores que o tamanho de um uint8_t (255)
+                if (ImGuiMCP::InputInt("##val", &skillVal, 1, 5)) {
                     if (skillVal < 0) skillVal = 0;
                     if (skillVal > 255) skillVal = 255;
                     ui_skills[i] = static_cast<uint8_t>(skillVal);
+                }
+            }
+            ImGuiMCP::PopID();
+
+            ImGuiMCP::TableSetColumnIndex(2);
+            ImGuiMCP::PushID(i + 100);
+            if (isLocked) ImGuiMCP::Text("%d", ui_skillOffsets[i]);
+            else {
+                int offsetVal = ui_skillOffsets[i];
+                ImGuiMCP::SetNextItemWidth(200.0f);
+                if (ImGuiMCP::InputInt("##off", &offsetVal, 1, 5)) {
+                    if (offsetVal < 0) offsetVal = 0;
+                    if (offsetVal > 255) offsetVal = 255;
+                    ui_skillOffsets[i] = static_cast<uint8_t>(offsetVal);
                 }
             }
             ImGuiMCP::PopID();
@@ -823,11 +1098,11 @@ void DrawMainEditorUI() {
     ImGuiMCP::Separator();
 
     // --- PAINEL DE PERKS ---
-    ImGuiMCP::Text("Perks");
+    ImGuiMCP::Text("%s", GetLoc("text.perks", "Perks"));
     if (ImGuiMCP::BeginTable("PerksTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
-        ImGuiMCP::TableSetupColumn("Action", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 40.0f);
-        ImGuiMCP::TableSetupColumn("Perk EditorID", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
-        ImGuiMCP::TableSetupColumn("Rank", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.perk_edid", "Perk EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.rank", "Rank"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
         ImGuiMCP::TableHeadersRow();
 
         int to_remove_perk = -1;
@@ -857,9 +1132,10 @@ void DrawMainEditorUI() {
     if (!isLocked) {
         static RE::BGSPerk* newPerk = nullptr;
         static int s_newPerkIdx = 0;
-        DrawDropdown("Add Perk", "Perk", &newPerk, s_newPerkIdx, false, 300.0f);
+        DrawDropdown(GetLoc("ui.add_perk", "Add Perk"), "Perk", &newPerk, s_newPerkIdx, false, 300.0f);
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Add##Perk") && newPerk) {
+        std::string addBtnStr = std::string(GetLoc("btn.add", "Add")) + "##Perk";
+        if (ImGuiMCP::Button(addBtnStr.c_str()) && newPerk) {
             bool exists = false;
             for (const auto& p : ui_perks) { if (p.perk == newPerk) exists = true; }
             if (!exists) ui_perks.push_back({ newPerk, 1 });
@@ -868,11 +1144,11 @@ void DrawMainEditorUI() {
     ImGuiMCP::Separator();
 
     // --- PAINEL DE FACTIONS ---
-    ImGuiMCP::Text("Factions");
+    ImGuiMCP::Text("%s", GetLoc("text.factions", "Factions"));
     if (ImGuiMCP::BeginTable("FactionsTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
-        ImGuiMCP::TableSetupColumn("Action", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 40.0f);
-        ImGuiMCP::TableSetupColumn("Faction EditorID", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
-        ImGuiMCP::TableSetupColumn("Rank", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.faction_edid", "Faction EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.rank", "Rank"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
         ImGuiMCP::TableHeadersRow();
 
         int to_remove_faction = -1;
@@ -902,24 +1178,61 @@ void DrawMainEditorUI() {
     if (!isLocked) {
         static RE::TESFaction* newFaction = nullptr;
         static int s_newFactionIdx = 0;
-        DrawDropdown("Add Faction", "Faction", &newFaction, s_newFactionIdx, false, 300.0f);
+        DrawDropdown(GetLoc("ui.add_faction", "Add Faction"), "Faction", &newFaction, s_newFactionIdx, false, 300.0f);
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Add##Faction") && newFaction) {
+        std::string addFacBtnStr = std::string(GetLoc("btn.add", "Add")) + "##Faction";
+        if (ImGuiMCP::Button(addFacBtnStr.c_str()) && newFaction) {
             bool exists = false;
             for (const auto& f : ui_factions) { if (f.faction == newFaction) exists = true; }
             if (!exists) ui_factions.push_back({ newFaction, 0 });
         }
     }
+
+    ImGuiMCP::Text("%s", GetLoc("text.spells", "Spells"));
+    if (ImGuiMCP::BeginTable("SpellsTable", 2, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
+        ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.spell_edid", "Spell EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableHeadersRow();
+
+        int to_remove_spell = -1;
+        for (size_t i = 0; i < ui_spells.size(); i++) {
+            ImGuiMCP::PushID(static_cast<int>(i + 2000));
+            ImGuiMCP::TableNextRow();
+
+            ImGuiMCP::TableSetColumnIndex(0);
+            if (!isLocked && ImGuiMCP::Button(" X ")) to_remove_spell = static_cast<int>(i);
+
+            ImGuiMCP::TableSetColumnIndex(1);
+            ImGuiMCP::Text("%s", ui_spells[i] ? clib_util::editorID::get_editorID(ui_spells[i]).c_str() : "Null");
+
+            ImGuiMCP::PopID();
+        }
+        ImGuiMCP::EndTable();
+        if (to_remove_spell != -1) ui_spells.erase(ui_spells.begin() + to_remove_spell);
+    }
+    if (!isLocked) {
+        static RE::SpellItem* newSpell = nullptr;
+        static int s_newSpellIdx = 0;
+        DrawDropdown(GetLoc("ui.add_spell", "Add Spell"), "Spell", &newSpell, s_newSpellIdx, false, 300.0f);
+        ImGuiMCP::SameLine();
+        std::string addSpellBtnStr = std::string(GetLoc("btn.add", "Add")) + "##Spell";
+        if (ImGuiMCP::Button(addSpellBtnStr.c_str()) && newSpell) {
+            if (std::find(ui_spells.begin(), ui_spells.end(), newSpell) == ui_spells.end()) {
+                ui_spells.push_back(newSpell);
+            }
+        }
+    }
+    ImGuiMCP::Separator();
 }
 
 void NSettings::Presets() {
-    ImGuiMCP::Text("Stats Preset Manager");
+    ImGuiMCP::Text("%s", GetLoc("text.preset_manager", "Stats Preset Manager"));
     ImGuiMCP::Separator();
     RefreshAvailablePresets();
 
     static std::map<std::string, std::vector<std::string>> presetUsageDB;
     static bool needsUsageScan = true;
-    if (ImGuiMCP::Button("Refresh Usage List") || needsUsageScan) {
+    if (ImGuiMCP::Button(GetLoc("btn.refresh_usage", "Refresh Usage List")) || needsUsageScan) {
         presetUsageDB.clear();
         if (std::filesystem::exists(NPCPath)) {
             for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
@@ -948,11 +1261,11 @@ void NSettings::Presets() {
     static bool deleteLinkedNPCs = false;
 
     if (ImGuiMCP::BeginTable("PresetDB", 5, tableFlags)) {
-        ImGuiMCP::TableSetupColumn("Edit", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGuiMCP::TableSetupColumn("Export", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGuiMCP::TableSetupColumn("Delete", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGuiMCP::TableSetupColumn("Preset Name", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
-        ImGuiMCP::TableSetupColumn("Affected NPCs", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.edit", "Edit"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.export", "Export"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.delete", "Delete"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.preset_name", "Preset Name"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.affected_npcs", "Affected NPCs"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
         ImGuiMCP::TableHeadersRow();
 
         for (const auto& pName : ui_availablePresets) {
@@ -960,19 +1273,19 @@ void NSettings::Presets() {
             ImGuiMCP::TableNextRow();
 
             ImGuiMCP::TableSetColumnIndex(0);
-            if (ImGuiMCP::Button("Edit")) LoadPresetToUI(pName);
+            if (ImGuiMCP::Button(GetLoc("col.edit", "Edit"))) LoadPresetToUI(pName);
 
             ImGuiMCP::TableSetColumnIndex(1);
             if (isEditingPreset && activePresetName == pName && HasUnsavedChanges()) {
-                ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "Save First");
+                ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.save_first", "Save First"));
             }
             else {
-                if (ImGuiMCP::Button("Export")) ExportPresetAsZip(pName);
+                if (ImGuiMCP::Button(GetLoc("col.export", "Export"))) ExportPresetAsZip(pName);
             }
 
             ImGuiMCP::TableSetColumnIndex(2);
             ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.8f, 0.2f, 0.2f, 1.0f });
-            if (ImGuiMCP::Button("Delete")) {
+            if (ImGuiMCP::Button(GetLoc("col.delete", "Delete"))) {
                 presetToDelete = pName;
                 deleteLinkedNPCs = false;
                 openDeleteModal = true;
@@ -986,7 +1299,7 @@ void NSettings::Presets() {
             std::string users = "";
             for (const auto& u : presetUsageDB[pName]) users += u + ", ";
             if (!users.empty()) { users.pop_back(); users.pop_back(); }
-            ImGuiMCP::TextWrapped("%s", users.empty() ? "None" : users.c_str());
+            ImGuiMCP::TextWrapped("%s", users.empty() ? GetLoc("text.none", "None") : users.c_str());
 
             ImGuiMCP::PopID();
         }
@@ -994,16 +1307,18 @@ void NSettings::Presets() {
     }
 
     // Modal de Delete
-    if (openDeleteModal) ImGuiMCP::OpenPopup("Confirm Delete Preset");
-    if (ImGuiMCP::BeginPopupModal("Confirm Delete Preset", &openDeleteModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGuiMCP::Text("Delete preset '%s'?", presetToDelete.c_str());
+    const char* popupDeleteLabel = GetLoc("modal.confirm_delete", "Confirm Delete Preset");
+    if (openDeleteModal) ImGuiMCP::OpenPopup(popupDeleteLabel);
+
+    if (ImGuiMCP::BeginPopupModal(popupDeleteLabel, &openDeleteModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGuiMCP::Text(GetLoc("ui.delete_preset_q", "Delete preset '%s'?"), presetToDelete.c_str());
         ImGuiMCP::Separator();
         auto& users = presetUsageDB[presetToDelete];
         if (!users.empty()) {
-            ImGuiMCP::TextColored({ 1.0f, 0.6f, 0.2f, 1.0f }, "Warning: Used by %d NPC(s).", (int)users.size());
-            ImGuiMCP::Checkbox("Also delete the JSON edits for these affected NPCs?", &deleteLinkedNPCs);
+            ImGuiMCP::TextColored({ 1.0f, 0.6f, 0.2f, 1.0f }, GetLoc("text.warning_used", "Warning: Used by %d NPC(s)."), (int)users.size());
+            ImGuiMCP::Checkbox(GetLoc("text.delete_linked", "Also delete the JSON edits for these affected NPCs?"), &deleteLinkedNPCs);
         }
-        if (ImGuiMCP::Button("Yes, Delete", ImGuiMCP::ImVec2(120, 0))) {
+        if (ImGuiMCP::Button(GetLoc("btn.yes_delete", "Yes, Delete"), ImGuiMCP::ImVec2(120, 0))) {
             std::string presetPath = std::format("{}/{}.json", PresetsPath, presetToDelete);
             if (std::filesystem::exists(presetPath)) std::filesystem::remove(presetPath);
             if (deleteLinkedNPCs && !users.empty()) {
@@ -1019,7 +1334,7 @@ void NSettings::Presets() {
             ImGuiMCP::CloseCurrentPopup();
         }
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Cancel", ImGuiMCP::ImVec2(120, 0))) { openDeleteModal = false; ImGuiMCP::CloseCurrentPopup(); }
+        if (ImGuiMCP::Button(GetLoc("btn.cancel", "Cancel"), ImGuiMCP::ImVec2(120, 0))) { openDeleteModal = false; ImGuiMCP::CloseCurrentPopup(); }
         ImGuiMCP::EndPopup();
     }
 }
@@ -1029,8 +1344,8 @@ void NSettings::NPCList() {
     const auto& npcList = manager->GetList("NPC");
 
     if (npcList.empty()) {
-        ImGuiMCP::Text("No NPCs loaded into memory.");
-        if (ImGuiMCP::Button("Force Scan")) manager->PopulateAllLists();
+        ImGuiMCP::Text("%s", GetLoc("text.no_npcs", "No NPCs loaded into memory."));
+        if (ImGuiMCP::Button(GetLoc("btn.force_scan", "Force Scan"))) manager->PopulateAllLists();
         return;
     }
 
@@ -1063,16 +1378,16 @@ void NSettings::NPCList() {
         needScan = false;
     }
 
-    if (ImGuiMCP::Button("Refresh Database")) needScan = true;
+    if (ImGuiMCP::Button(GetLoc("btn.refresh_db", "Refresh Database"))) needScan = true;
 
     static char filterBuffer[256] = "";
     static bool showOnlyAffected = false;
     static std::vector<size_t> cachedFilteredIndices;
 
     ImGuiMCP::SetNextItemWidth(200.0f);
-    bool searchChanged = ImGuiMCP::InputText("Filter Name/EditorID", filterBuffer, sizeof(filterBuffer));
+    bool searchChanged = ImGuiMCP::InputText(GetLoc("ui.filter_name", "Filter Name/EditorID"), filterBuffer, sizeof(filterBuffer));
     ImGuiMCP::SameLine();
-    bool toggleChanged = ImGuiMCP::Checkbox("Only Modified NPCs", &showOnlyAffected);
+    bool toggleChanged = ImGuiMCP::Checkbox(GetLoc("ui.only_modified", "Only Modified NPCs"), &showOnlyAffected);
 
     if (searchChanged || toggleChanged || cachedFilteredIndices.empty()) {
         cachedFilteredIndices.clear();
@@ -1094,17 +1409,17 @@ void NSettings::NPCList() {
         }
     }
 
-    ImGuiMCP::Text("Showing %d NPCs", (int)cachedFilteredIndices.size());
+    ImGuiMCP::Text(GetLoc("text.showing_npcs", "Showing %d NPCs"), (int)cachedFilteredIndices.size());
     ImGuiMCP::Separator();
 
     auto tableFlags = ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg |
         ImGuiMCP::ImGuiTableFlags_Resizable | ImGuiMCP::ImGuiTableFlags_ScrollY;
 
     if (ImGuiMCP::BeginTable("NPCDatabaseTable", 4, tableFlags)) {
-        ImGuiMCP::TableSetupColumn("Action", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGuiMCP::TableSetupColumn("FormID", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGuiMCP::TableSetupColumn("Name / EditorID", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
-        ImGuiMCP::TableSetupColumn("Status", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.formid", "FormID"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.name_edid", "Name / EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.status", "Status"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 150.0f);
         ImGuiMCP::TableHeadersRow();
 
         static auto clipper = ImGuiMCP::ImGuiListClipperManager::Create();
@@ -1121,7 +1436,7 @@ void NSettings::NPCList() {
                 ImGuiMCP::TableNextRow();
                 ImGuiMCP::TableSetColumnIndex(0);
                 ImGuiMCP::PushID(static_cast<int>(item.formID));
-                if (ImGuiMCP::Button("Edit")) {
+                if (ImGuiMCP::Button(GetLoc("col.edit", "Edit"))) {
                     if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(item.formID)) {
                         LoadNPCToUI(npc, nullptr);
                     }
@@ -1133,11 +1448,11 @@ void NSettings::NPCList() {
 
                 ImGuiMCP::TableSetColumnIndex(3);
                 if (dbIt != affectedDB.end()) {
-                    if (dbIt->second == "Custom") ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, "MODIFIED");
-                    else ImGuiMCP::TextColored({ 0.2f, 1.0f, 1.0f, 1.0f }, "Preset: %s", dbIt->second.c_str());
+                    if (dbIt->second == "Custom") ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, "%s", GetLoc("text.modified", "MODIFIED"));
+                    else ImGuiMCP::TextColored({ 0.2f, 1.0f, 1.0f, 1.0f }, GetLoc("text.preset_status", "Preset: %s"), dbIt->second.c_str());
                 }
                 else {
-                    ImGuiMCP::TextDisabled("Default");
+                    ImGuiMCP::TextDisabled("%s", GetLoc("text.default", "Default"));
                 }
             }
         }
@@ -1148,14 +1463,14 @@ void NSettings::NPCList() {
 
 void NSettings::NPCMenu() {
     if (!isEditingPreset) {
-        if (ImGuiMCP::Button("Load Selected NPC (Console)")) {
+        if (ImGuiMCP::Button(GetLoc("btn.load_npc", "Load Selected NPC (Console)"))) {
             LoadNPCToUI();
         }
     }
 
     if (isEditingPreset) {
-        ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, "PRESET EDIT MODE: %s", activePresetName.c_str());
-        if (ImGuiMCP::Button("<- Exit Preset Editor")) {
+        ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, GetLoc("text.preset_edit_mode", "PRESET EDIT MODE: %s"), activePresetName.c_str());
+        if (ImGuiMCP::Button(GetLoc("btn.exit_preset", "<- Exit Preset Editor"))) {
             isEditingPreset = false;
             activePresetName = "";
             g_currentNPC = nullptr;
@@ -1165,27 +1480,17 @@ void NSettings::NPCMenu() {
     }
     else {
         if (!g_currentNPC) {
-            ImGuiMCP::Text("Open the game console, select an NPC and press 'Load'.");
+            ImGuiMCP::Text("%s", GetLoc("text.open_console", "Open the game console, select an NPC and press 'Load'."));
         }
         else {
-            std::string label = std::format("Editing NPC: {} [{:08X}]", g_currentNPC->GetFullName() ? g_currentNPC->GetFullName() : "Unnamed", g_currentNPC->GetFormID());
-            ImGuiMCP::Text(label.c_str());
+            ImGuiMCP::Text(GetLoc("text.editing_npc", "Editing NPC: %s [%08X]"),
+                g_currentNPC->GetFullName() ? g_currentNPC->GetFullName() : "Unnamed",
+                g_currentNPC->GetFormID());
             ImGuiMCP::Separator();
             DrawMainEditorUI();
         }
     }
 }
-
-void NSettings::MmRegister() {
-    if (SKSEMenuFramework::IsInstalled()) {
-        SKSEMenuFramework::SetSection("NPC Stats Editor");
-        SKSEMenuFramework::AddSectionItem("Editor", NPCMenu);
-        SKSEMenuFramework::AddSectionItem("Presets", Presets);
-        SKSEMenuFramework::AddSectionItem("Database", NPCList);
-        logger::info("[MmRegister] Stats Menu sections registered successfully.");
-    }
-}
-
 void NSettings::Load() {
     logger::info("[Load] Inicializando sistema de arquivos de Stats...");
     std::filesystem::create_directories(NPCPath);
@@ -1264,4 +1569,17 @@ void NSettings::Load() {
         }
     }
     logger::info("[NPC Stats Replacer] BOOT CONCLUIDO: {} presets em cache, {} NPCs modificados.", countPresetsCarregados, countNPCsModificados);
+}
+
+void NSettings::MmRegister() {
+    if (SKSEMenuFramework::IsInstalled()) {
+        // Carrega o idioma no momento do Registro do menu!
+        LoadLanguage();
+
+        SKSEMenuFramework::SetSection("NPC Stats Editor");
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.editor", "Editor"), NPCMenu);
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.presets", "Presets"), Presets);
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.database", "Database"), NPCList);
+        logger::info("[MmRegister] Stats Menu sections registered successfully.");
+    }
 }
