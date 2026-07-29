@@ -1,5 +1,6 @@
 ﻿#include "Hooks.h"
 #include "Manager.h"
+#include "Settings.h"
 
 // ==============================================================================
 // SISTEMA DE AGENDAMENTO (POLLING PARA 3D CARREGADO)
@@ -30,7 +31,7 @@ namespace TaskScheduler {
                         if (auto actor = ref->As<RE::Actor>()) {
                             if (auto base = actor->GetActorBase()) {
                                 if (Manager::GetSingleton()->IsNPCAffected(base->GetFormID())) {
-                                    Manager::GetSingleton()->LoadAndApplyActorCustomizations(actor);
+                                    NSettings::LoadAndApplyActorCustomizations(actor);
                                 }
                             }
                         }
@@ -74,7 +75,7 @@ void Load3DHook::ProcessLoad3D(RE::TESObjectREFR* a_this, RE::NiAVObject* result
             if (auto actor = a_this->As<RE::Actor>()) {
                 if (auto base = actor->GetActorBase()) {
                     if (Manager::GetSingleton()->IsNPCAffected(base->GetFormID())) {
-                        Manager::GetSingleton()->LoadAndApplyActorCustomizations(actor);
+                        NSettings::LoadAndApplyActorCustomizations(actor);
                     }
                 }
             }

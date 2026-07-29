@@ -61,6 +61,8 @@ namespace {
 // Variaveis de estado para a UI
 static RE::Actor* g_currentActor = nullptr;
 static RE::TESNPC* g_currentNPC = nullptr;
+static RE::Actor* g_presetReturnActor = nullptr;
+static RE::TESNPC* g_presetReturnNPC = nullptr;
 
 static bool isEditingPreset = false;
 static std::string activePresetName = "";
@@ -123,15 +125,388 @@ struct UIFaction {
 static std::vector<UIPerk> ui_perks;
 static std::vector<UIFaction> ui_factions;
 static std::vector<RE::SpellItem*> ui_spells;
+static bool ui_managePerks = true;
+static bool ui_manageFactions = true;
+static bool ui_manageSpells = true;
 // Backups e Engine States
 static rapidjson::Document originalEngineState;
+static rapidjson::Document g_originalNPCState;
+static rapidjson::Document g_npcEditState;
+static rapidjson::Document g_activePresetState;
 static std::map<RE::FormID, std::string> g_vanillaNPCStates;
 static std::string g_lastSavedStateStr = "";
 static std::string g_lastSavedPresetLink = "";
 
+enum class FieldSource {
+    kOriginal = 0,
+    kEdited = 1,
+    kPreset = 2
+};
+
+struct FieldGroup {
+    const char* key;
+    std::vector<const char*> members;
+};
+
+static const std::vector<FieldGroup> kFieldGroups = {
+    { "health", { "health", "healthOffset" } },
+    { "magicka", { "magicka", "magickaOffset" } },
+    { "stamina", { "stamina", "staminaOffset" } },
+    { "level", { "calcStats", "level", "calcMinLevel", "calcMaxLevel" } },
+    { "speed", { "speedMult" } },
+    { "disposition", { "dispositionBase" } },
+    { "bleedout", { "bleedoutOverride" } },
+    { "flags", { "isEssential", "isProtected", "isUnique", "doesntAffectStealthMeter" } },
+    { "attackDamageMult", { "attackDamageMult" } },
+    { "healRateMult", { "healRateMult" } },
+    { "magickaRateMult", { "magickaRateMult" } },
+    { "staminaRateMult", { "staminaRateMult" } },
+    { "class", { "class" } },
+    { "combatStyle", { "combatStyle" } },
+    { "skills", { "skills", "skillOffsets" } },
+    { "perks", { "perksMode", "perks" } },
+    { "factions", { "factionsMode", "factions" } },
+    { "spells", { "spellsMode", "spells" } }
+};
+
+using FieldSourceMap = std::map<std::string, FieldSource>;
+static FieldSourceMap ui_fieldSources;
+
+void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson);
+
 // ==========================================
 // FUNÇÕES AUXILIARES E JSON
 // ==========================================
+
+bool ShouldManageCollection(
+    const rapidjson::Document& doc,
+    const char* modeMember,
+    const char* collectionMember) {
+    if (doc.HasMember(modeMember) && doc[modeMember].IsString()) {
+        return std::string_view(doc[modeMember].GetString()) == "replaceBase";
+    }
+
+    // Legacy migration: populated arrays keep their old meaning. Empty arrays
+    // become non-destructive and are treated as inherited data.
+    return doc.HasMember(collectionMember) &&
+           doc[collectionMember].IsArray() &&
+           !doc[collectionMember].Empty();
+}
+
+const char* FieldSourceToString(FieldSource source) {
+    switch (source) {
+    case FieldSource::kOriginal:
+        return "original";
+    case FieldSource::kPreset:
+        return "preset";
+    case FieldSource::kEdited:
+    default:
+        return "edited";
+    }
+}
+
+FieldSource FieldSourceFromString(std::string_view source) {
+    if (source == "original") return FieldSource::kOriginal;
+    if (source == "preset") return FieldSource::kPreset;
+    return FieldSource::kEdited;
+}
+
+void SetAllFieldSources(FieldSourceMap& sources, FieldSource source) {
+    sources.clear();
+    for (const auto& group : kFieldGroups) {
+        sources[group.key] = source;
+    }
+}
+
+void SetAllFieldSources(FieldSource source) {
+    SetAllFieldSources(ui_fieldSources, source);
+}
+
+FieldSource GetFieldSource(const FieldSourceMap& sources, std::string_view key) {
+    const auto it = sources.find(std::string(key));
+    return it != sources.end() ? it->second : FieldSource::kEdited;
+}
+
+FieldSource GetFieldSource(std::string_view key) {
+    return GetFieldSource(ui_fieldSources, key);
+}
+
+void CopyJSONDocument(rapidjson::Document& destination, const rapidjson::Document& source) {
+    destination.SetObject();
+    if (source.IsObject()) {
+        destination.CopyFrom(source, destination.GetAllocator());
+    }
+}
+
+void CopyJSONMember(
+    rapidjson::Document& destination,
+    const rapidjson::Document& source,
+    const char* memberName) {
+    if (!source.IsObject() || !source.HasMember(memberName)) return;
+
+    if (destination.HasMember(memberName)) {
+        destination.RemoveMember(memberName);
+    }
+
+    auto& allocator = destination.GetAllocator();
+    rapidjson::Value name(memberName, allocator);
+    rapidjson::Value value;
+    value.CopyFrom(source[memberName], allocator);
+    destination.AddMember(name, value, allocator);
+}
+
+bool ReadJSONDocument(const std::string& path, rapidjson::Document& document) {
+    document.SetObject();
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, path.c_str(), "rb");
+    if (!fp) return false;
+
+    char readBuffer[65536];
+    rapidjson::FileReadStream stream(fp, readBuffer, sizeof(readBuffer));
+    document.ParseStream(stream);
+    fclose(fp);
+
+    if (!document.IsObject()) {
+        document.SetObject();
+        return false;
+    }
+    return true;
+}
+
+bool WriteJSONDocument(
+    const std::string& path,
+    const rapidjson::Document& document) {
+    FILE* file = nullptr;
+    fopen_s(&file, path.c_str(), "wb");
+    if (!file) return false;
+
+    char writeBuffer[65536];
+    rapidjson::FileWriteStream output(
+        file,
+        writeBuffer,
+        sizeof(writeBuffer));
+    rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(output);
+    document.Accept(writer);
+    fclose(file);
+    return true;
+}
+
+RE::TESNPC* LookupNPCFromConfigName(const std::string& name) {
+    if (auto* form = RE::TESForm::LookupByEditorID(name)) {
+        if (auto* npc = form->As<RE::TESNPC>()) return npc;
+    }
+
+    try {
+        const auto formID = static_cast<RE::FormID>(
+            std::stoul(name, nullptr, 16));
+        if (auto* form = RE::TESForm::LookupByID(formID)) {
+            return form->As<RE::TESNPC>();
+        }
+    }
+    catch (...) {
+    }
+
+    return nullptr;
+}
+
+std::string GetNPCConfigName(RE::TESNPC* npc) {
+    if (!npc) return {};
+
+    std::string editorID = clib_util::editorID::get_editorID(npc);
+    if (!editorID.empty()) return editorID;
+    return std::format("{:08X}", npc->GetFormID());
+}
+
+bool EqualsCaseInsensitive(
+    std::string_view left,
+    std::string_view right) {
+    return left.size() == right.size() &&
+           std::equal(
+               left.begin(),
+               left.end(),
+               right.begin(),
+               [](unsigned char leftCharacter,
+                  unsigned char rightCharacter) {
+                   return std::tolower(leftCharacter) ==
+                          std::tolower(rightCharacter);
+               });
+}
+
+void EnsureOriginalNPCState(RE::TESNPC* npc) {
+    if (!npc || g_vanillaNPCStates.contains(npc->GetFormID())) return;
+
+    std::string originalJSON;
+    CaptureVanillaState(npc, originalJSON);
+    g_vanillaNPCStates[npc->GetFormID()] = std::move(originalJSON);
+}
+
+void LoadFieldSourcesFromPreset(
+    const rapidjson::Document& preset,
+    FieldSourceMap& sources) {
+    SetAllFieldSources(sources, FieldSource::kEdited);
+
+    if (preset.HasMember("fieldSources") && preset["fieldSources"].IsObject()) {
+        const auto& storedSources = preset["fieldSources"];
+        for (const auto& group : kFieldGroups) {
+            if (storedSources.HasMember(group.key) && storedSources[group.key].IsString()) {
+                sources[group.key] =
+                    FieldSourceFromString(storedSources[group.key].GetString());
+            }
+        }
+        return;
+    }
+
+    // Legacy presets controlled every scalar member they contained. Empty
+    // collections were already migrated to inherited behavior and therefore
+    // map to the per-NPC edited layer.
+    for (const auto& group : kFieldGroups) {
+        if (std::string_view(group.key) == "perks") {
+            sources[group.key] =
+                ShouldManageCollection(preset, "perksMode", "perks") ?
+                FieldSource::kPreset :
+                FieldSource::kEdited;
+            continue;
+        }
+        if (std::string_view(group.key) == "factions") {
+            sources[group.key] =
+                ShouldManageCollection(preset, "factionsMode", "factions") ?
+                FieldSource::kPreset :
+                FieldSource::kEdited;
+            continue;
+        }
+        if (std::string_view(group.key) == "spells") {
+            sources[group.key] =
+                ShouldManageCollection(preset, "spellsMode", "spells") ?
+                FieldSource::kPreset :
+                FieldSource::kEdited;
+            continue;
+        }
+
+        const bool hasPresetValue = std::ranges::any_of(
+            group.members,
+            [&preset](const char* member) { return preset.HasMember(member); });
+        if (hasPresetValue) {
+            sources[group.key] = FieldSource::kPreset;
+        }
+    }
+}
+
+void LoadFieldSourcesFromPreset(const rapidjson::Document& preset) {
+    LoadFieldSourcesFromPreset(preset, ui_fieldSources);
+}
+
+void AddFieldSourcesToJSON(rapidjson::Document& document) {
+    auto& allocator = document.GetAllocator();
+    rapidjson::Value sources(rapidjson::kObjectType);
+
+    for (const auto& group : kFieldGroups) {
+        rapidjson::Value key(group.key, allocator);
+        rapidjson::Value value(FieldSourceToString(GetFieldSource(group.key)), allocator);
+        sources.AddMember(key, value, allocator);
+    }
+
+    if (document.HasMember("fieldSources")) {
+        document.RemoveMember("fieldSources");
+    }
+    document.AddMember("fieldSources", sources, allocator);
+}
+
+void BuildEffectiveNPCDocument(
+    const rapidjson::Document& original,
+    const rapidjson::Document& edited,
+    const rapidjson::Document& preset,
+    const FieldSourceMap& sources,
+    rapidjson::Document& effective) {
+    effective.SetObject();
+
+    for (const auto& group : kFieldGroups) {
+        const auto source = GetFieldSource(sources, group.key);
+        const std::string_view groupKey = group.key;
+        const bool isCollection =
+            groupKey == "perks" ||
+            groupKey == "factions" ||
+            groupKey == "spells";
+        const auto managesCollection = [groupKey](const rapidjson::Document& document) {
+            if (groupKey == "perks") {
+                return ShouldManageCollection(document, "perksMode", "perks");
+            }
+            if (groupKey == "factions") {
+                return ShouldManageCollection(document, "factionsMode", "factions");
+            }
+            if (groupKey == "spells") {
+                return ShouldManageCollection(document, "spellsMode", "spells");
+            }
+            return true;
+        };
+        const bool editedAvailable =
+            !isCollection || managesCollection(edited);
+        const bool presetAvailable =
+            !isCollection || managesCollection(preset);
+
+        for (const auto* member : group.members) {
+            const rapidjson::Document* selected = nullptr;
+
+            if (source == FieldSource::kOriginal) {
+                if (original.HasMember(member)) selected = std::addressof(original);
+            }
+            else if (source == FieldSource::kEdited) {
+                if (editedAvailable && edited.HasMember(member)) selected = std::addressof(edited);
+                else if (original.HasMember(member)) selected = std::addressof(original);
+            }
+            else {
+                if (presetAvailable && preset.HasMember(member)) selected = std::addressof(preset);
+                else if (editedAvailable && edited.HasMember(member)) selected = std::addressof(edited);
+                else if (original.HasMember(member)) selected = std::addressof(original);
+            }
+
+            if (selected) {
+                CopyJSONMember(effective, *selected, member);
+            }
+        }
+    }
+
+    // A resolved collection is always an explicit replacement of the captured
+    // NPC base. Manager's ownership reconciliation still preserves entries
+    // supplied externally after that capture.
+    auto& allocator = effective.GetAllocator();
+    for (const auto* modeMember : { "perksMode", "factionsMode", "spellsMode" }) {
+        if (effective.HasMember(modeMember)) effective.RemoveMember(modeMember);
+        rapidjson::Value modeName(modeMember, allocator);
+        rapidjson::Value modeValue("replaceBase", allocator);
+        effective.AddMember(modeName, modeValue, allocator);
+    }
+}
+
+void BuildEffectiveNPCDocument(
+    const rapidjson::Document& original,
+    const rapidjson::Document& edited,
+    const rapidjson::Document& preset,
+    rapidjson::Document& effective) {
+    BuildEffectiveNPCDocument(
+        original,
+        edited,
+        preset,
+        ui_fieldSources,
+        effective);
+}
+
+void ExtractNPCEditDocument(const rapidjson::Document& stored, rapidjson::Document& edited) {
+    edited.SetObject();
+    if (!stored.IsObject()) return;
+
+    for (auto member = stored.MemberBegin(); member != stored.MemberEnd(); ++member) {
+        const std::string_view name = member->name.GetString();
+        if (name == "preset" || name == "fieldSources") continue;
+
+        auto& allocator = edited.GetAllocator();
+        rapidjson::Value copiedName;
+        copiedName.CopyFrom(member->name, allocator);
+        rapidjson::Value copiedValue;
+        copiedValue.CopyFrom(member->value, allocator);
+        edited.AddMember(copiedName, copiedValue, allocator);
+    }
+}
 
 void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     rapidjson::Document doc;
@@ -184,6 +559,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     doc.AddMember("skills", skillsArray, allocator);
     doc.AddMember("skillOffsets", skillOffArray, allocator);
 
+    doc.AddMember("perksMode", "replaceBase", allocator);
     rapidjson::Value perkArray(rapidjson::kArrayType);
     for (std::uint32_t i = 0; i < npc->perkCount; i++) {
         if (npc->perks && npc->perks[i].perk) {
@@ -195,6 +571,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     }
     doc.AddMember("perks", perkArray, allocator);
 
+    doc.AddMember("factionsMode", "replaceBase", allocator);
     rapidjson::Value factionArray(rapidjson::kArrayType);
     for (auto& f : npc->factions) {
         if (f.faction) {
@@ -206,6 +583,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     }
     doc.AddMember("factions", factionArray, allocator);
 
+    doc.AddMember("spellsMode", "replaceBase", allocator);
     rapidjson::Value spellArray(rapidjson::kArrayType);
     if (auto spellList = npc->GetSpellList()) {
         for (std::uint32_t i = 0; i < spellList->numSpells; i++) {
@@ -222,7 +600,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     outJson = buffer.GetString();
 }
 
-void GenerateJSONFromUI(rapidjson::Document& doc) {
+void GenerateJSONFromUI(rapidjson::Document& doc, bool includeFieldSources = false) {
     auto& allocator = doc.GetAllocator();
     doc.SetObject();
 
@@ -265,6 +643,10 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     doc.AddMember("skills", skillsArray, allocator);
     doc.AddMember("skillOffsets", skillOffArray, allocator);
 
+    doc.AddMember(
+        "perksMode",
+        rapidjson::Value("replaceBase", allocator),
+        allocator);
     rapidjson::Value perkArray(rapidjson::kArrayType);
     for (const auto& p : ui_perks) {
         if (p.perk) {
@@ -276,6 +658,10 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     }
     doc.AddMember("perks", perkArray, allocator);
 
+    doc.AddMember(
+        "factionsMode",
+        rapidjson::Value("replaceBase", allocator),
+        allocator);
     rapidjson::Value factionArray(rapidjson::kArrayType);
     for (const auto& f : ui_factions) {
         if (f.faction) {
@@ -287,16 +673,47 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     }
     doc.AddMember("factions", factionArray, allocator);
 
+    doc.AddMember(
+        "spellsMode",
+        rapidjson::Value("replaceBase", allocator),
+        allocator);
     rapidjson::Value spellArray(rapidjson::kArrayType);
     for (auto* sp : ui_spells) {
         if (sp) spellArray.PushBack(rapidjson::Value(FormUtil::NormalizeFormID(sp).c_str(), allocator), allocator);
     }
     doc.AddMember("spells", spellArray, allocator);
+
+    if (includeFieldSources) {
+        AddFieldSourcesToJSON(doc);
+    }
+}
+
+void UpdateNPCEditStateFromUI() {
+    rapidjson::Document uiDocument;
+    GenerateJSONFromUI(uiDocument);
+
+    const bool hasLinkedPreset = !ui_linkedPreset.empty() && !isEditingPreset;
+    for (const auto& group : kFieldGroups) {
+        if (hasLinkedPreset && GetFieldSource(group.key) != FieldSource::kEdited) {
+            continue;
+        }
+
+        for (const auto* member : group.members) {
+            if (g_npcEditState.HasMember(member)) {
+                g_npcEditState.RemoveMember(member);
+            }
+            CopyJSONMember(g_npcEditState, uiDocument, member);
+        }
+    }
 }
 
 void ParseJSONToUI(const rapidjson::Document& j) {
     ui_class = nullptr;
     ui_combatStyle = nullptr;
+    ui_managePerks = ShouldManageCollection(j, "perksMode", "perks");
+    ui_manageFactions = ShouldManageCollection(j, "factionsMode", "factions");
+    ui_manageSpells = ShouldManageCollection(j, "spellsMode", "spells");
+
     ui_perks.clear();
     ui_factions.clear();
     ui_spells.clear();
@@ -342,7 +759,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
         for (rapidjson::SizeType i = 0; i < sArray.Size() && i < 18; i++) ui_skillOffsets[i] = static_cast<uint8_t>(sArray[i].GetInt());
     }
 
-    if (j.HasMember("perks") && j["perks"].IsArray()) {
+    if (ui_managePerks && j.HasMember("perks") && j["perks"].IsArray()) {
         for (auto& p : j["perks"].GetArray()) {
             if (p.HasMember("form") && p.HasMember("rank")) {
                 if (auto perk = RE::TESForm::LookupByID<RE::BGSPerk>(FormUtil::FormIDFromString(p["form"].GetString()))) {
@@ -352,7 +769,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
         }
     }
 
-    if (j.HasMember("factions") && j["factions"].IsArray()) {
+    if (ui_manageFactions && j.HasMember("factions") && j["factions"].IsArray()) {
         for (auto& f : j["factions"].GetArray()) {
             if (f.HasMember("form") && f.HasMember("rank")) {
                 if (auto fac = RE::TESForm::LookupByID<RE::TESFaction>(FormUtil::FormIDFromString(f["form"].GetString()))) {
@@ -362,7 +779,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
         }
     }
 
-    if (j.HasMember("spells") && j["spells"].IsArray()) {
+    if (ui_manageSpells && j.HasMember("spells") && j["spells"].IsArray()) {
         for (auto& s : j["spells"].GetArray()) {
             if (auto sp = RE::TESForm::LookupByID<RE::SpellItem>(FormUtil::FormIDFromString(s.GetString()))) {
                 ui_spells.push_back(sp);
@@ -374,7 +791,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
 
 void UpdateLastSavedState() {
     rapidjson::Document doc;
-    GenerateJSONFromUI(doc);
+    GenerateJSONFromUI(doc, isEditingPreset);
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
@@ -385,7 +802,7 @@ void UpdateLastSavedState() {
 bool HasUnsavedChanges() {
     if (ui_linkedPreset != g_lastSavedPresetLink) return true;
     rapidjson::Document doc;
-    GenerateJSONFromUI(doc);
+    GenerateJSONFromUI(doc, isEditingPreset);
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
@@ -554,19 +971,18 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
 // CARREGAMENTO E APLICAÇÃO
 // ==========================================
 void LoadPresetToUI(const std::string& presetName) {
+    if (!isEditingPreset) {
+        g_presetReturnNPC = g_currentNPC;
+        g_presetReturnActor = g_currentActor;
+    }
     isEditingPreset = true;
     activePresetName = presetName;
-    ui_linkedPreset = "";
 
     std::string path = std::format("{}/{}.json", PresetsPath, presetName);
-    FILE* fp = nullptr;
-    fopen_s(&fp, path.c_str(), "rb");
-    if (fp) {
-        char readBuffer[65536];
-        rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-        rapidjson::Document doc;
-        doc.ParseStream(is);
-        fclose(fp);
+    rapidjson::Document doc;
+    if (ReadJSONDocument(path, doc)) {
+        CopyJSONDocument(g_activePresetState, doc);
+        LoadFieldSourcesFromPreset(doc);
         ParseJSONToUI(doc);
     }
     UpdateLastSavedState();
@@ -596,107 +1012,42 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     isEditingPreset = false;
     activePresetName = "";
     ui_linkedPreset = "";
+    SetAllFieldSources(FieldSource::kEdited);
 
-    // Extrai Base e Offsets
-    ui_health = static_cast<float>(g_currentNPC->playerSkills.health);
-    ui_magicka = static_cast<float>(g_currentNPC->playerSkills.magicka);
-    ui_stamina = static_cast<float>(g_currentNPC->playerSkills.stamina);
-
-    ui_healthOffset = g_currentNPC->actorData.healthOffset;
-    ui_magickaOffset = g_currentNPC->actorData.magickaOffset;
-    ui_staminaOffset = g_currentNPC->actorData.staminaOffset;
-
-    ui_calcMinLevel = g_currentNPC->actorData.calcLevelMin;
-    ui_calcMaxLevel = g_currentNPC->actorData.calcLevelMax;
-    ui_speedMult = g_currentNPC->actorData.speedMult;
-    ui_dispositionBase = g_currentNPC->actorData.baseDisposition;
-    ui_bleedoutOverride = g_currentNPC->actorData.bleedoutOverride;
-
-    auto flags = g_currentNPC->actorData.actorBaseFlags;
-    ui_isEssential = flags.all(RE::ACTOR_BASE_DATA::Flag::kEssential);
-    ui_isProtected = flags.all(RE::ACTOR_BASE_DATA::Flag::kProtected);
-    ui_isUnique = flags.all(RE::ACTOR_BASE_DATA::Flag::kUnique);
-    ui_calcStats = flags.all(RE::ACTOR_BASE_DATA::Flag::kPCLevelMult);
-    ui_doesntAffectStealthMeter = flags.all(RE::ACTOR_BASE_DATA::Flag::kDoesntAffectStealthMeter);
-    if (ui_calcStats) ui_levelMult = g_currentNPC->actorData.level / 1000.0f;
-    else ui_level = g_currentNPC->actorData.level;
-
-    ui_class = g_currentNPC->npcClass;
-    ui_combatStyle = g_currentNPC->combatStyle;
-
-    ui_attackDamageMult = 1.0f; 
-    ui_healRateMult = 100.0f; 
-    ui_magickaRateMult = 100.0f; 
-    ui_staminaRateMult = 100.0f;
-
-    if (g_currentActor) {
-        if (auto avOwner = g_currentActor->AsActorValueOwner()) {
-            ui_attackDamageMult = avOwner->GetActorValue(RE::ActorValue::kAttackDamageMult);
-            ui_healRateMult = avOwner->GetActorValue(RE::ActorValue::kHealRateMult);
-            ui_magickaRateMult = avOwner->GetActorValue(RE::ActorValue::kMagickaRateMult);
-            ui_staminaRateMult = avOwner->GetActorValue(RE::ActorValue::kStaminaRateMult);
-        }
-    }
-
-    for (int i = 0; i < 18; i++) {
-        ui_skills[i] = g_currentNPC->playerSkills.values[i];
-        ui_skillOffsets[i] = g_currentNPC->playerSkills.offsets[i];
-    }
-
-    ui_perks.clear();
-    for (std::uint32_t i = 0; i < g_currentNPC->perkCount; i++) {
-        if (g_currentNPC->perks && g_currentNPC->perks[i].perk) ui_perks.push_back({ g_currentNPC->perks[i].perk, g_currentNPC->perks[i].currentRank });
-    }
-
-    ui_factions.clear();
-    for (auto& f : g_currentNPC->factions) {
-        if (f.faction) ui_factions.push_back({ f.faction, f.rank });
-    }
-
-    ui_spells.clear();
-    if (auto spellList = g_currentNPC->GetSpellList()) {
-        for (std::uint32_t i = 0; i < spellList->numSpells; i++) {
-            if (spellList->spells && spellList->spells[i]) ui_spells.push_back(spellList->spells[i]);
-        }
-    }
-
-    GenerateJSONFromUI(originalEngineState);
+    g_originalNPCState.SetObject();
+    g_originalNPCState.Parse(g_vanillaNPCStates[g_currentNPC->GetFormID()].c_str());
+    if (!g_originalNPCState.IsObject()) g_originalNPCState.SetObject();
+    g_npcEditState.SetObject();
+    g_activePresetState.SetObject();
 
     std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
     if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
     std::string filePath = std::format("{}/{}.json", NPCPath, editorID);
 
     if (std::filesystem::exists(filePath)) {
-        FILE* fp = nullptr;
-        fopen_s(&fp, filePath.c_str(), "rb");
-        if (fp) {
-            char readBuffer[65536];
-            rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-            rapidjson::Document doc;
-            doc.ParseStream(is);
-            fclose(fp);
+        rapidjson::Document storedNPC;
+        if (ReadJSONDocument(filePath, storedNPC)) {
+            ExtractNPCEditDocument(storedNPC, g_npcEditState);
 
-            if (doc.IsObject()) {
-                if (doc.HasMember("preset") && doc["preset"].IsString()) {
-                    ui_linkedPreset = doc["preset"].GetString();
-                    std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
-                    FILE* pFp = nullptr;
-                    fopen_s(&pFp, pPath.c_str(), "rb");
-                    if (pFp) {
-                        char pReadBuffer[65536];
-                        rapidjson::FileReadStream pIs(pFp, pReadBuffer, sizeof(pReadBuffer));
-                        rapidjson::Document pDoc;
-                        pDoc.ParseStream(pIs);
-                        fclose(pFp);
-                        ParseJSONToUI(pDoc);
-                    }
-                }
-                else {
-                    ParseJSONToUI(doc);
+            if (storedNPC.HasMember("preset") && storedNPC["preset"].IsString()) {
+                ui_linkedPreset = storedNPC["preset"].GetString();
+                const std::string presetPath =
+                    std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
+                if (ReadJSONDocument(presetPath, g_activePresetState)) {
+                    LoadFieldSourcesFromPreset(g_activePresetState);
                 }
             }
         }
     }
+
+    rapidjson::Document effective;
+    BuildEffectiveNPCDocument(
+        g_originalNPCState,
+        g_npcEditState,
+        g_activePresetState,
+        effective);
+    ParseJSONToUI(effective);
+    CopyJSONDocument(originalEngineState, effective);
     UpdateLastSavedState();
 }
 void SaveData() {
@@ -706,17 +1057,17 @@ void SaveData() {
     std::string finalPath;
 
     if (isEditingPreset) {
-        GenerateJSONFromUI(doc);
+        GenerateJSONFromUI(doc, true);
+        CopyJSONDocument(g_activePresetState, doc);
         std::filesystem::create_directories(PresetsPath);
         finalPath = std::format("{}/{}.json", PresetsPath, activePresetName);
     }
     else {
         if (!g_currentNPC) return;
+        UpdateNPCEditStateFromUI();
+        CopyJSONDocument(doc, g_npcEditState);
         if (!ui_linkedPreset.empty()) {
             doc.AddMember("preset", rapidjson::Value(ui_linkedPreset.c_str(), allocator), allocator);
-        }
-        else {
-            GenerateJSONFromUI(doc);
         }
         std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
         if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
@@ -733,6 +1084,12 @@ void SaveData() {
         doc.Accept(writer);
         fclose(fp);
         logger::info("Stats saved to {}", finalPath);
+
+        if (!isEditingPreset && g_currentNPC) {
+            Manager::GetSingleton()->RegisterAffectedNPC(
+                g_currentNPC->GetFormID(),
+                "");
+        }
     }
 
     // Atualiza automaticamente os NPCs caso seja um preset
@@ -748,16 +1105,41 @@ void SaveData() {
                     npcDoc.ParseStream(is);
                     fclose(nFp);
 
-                    if (npcDoc.IsObject() && npcDoc.HasMember("preset") && npcDoc["preset"].GetString() == activePresetName) {
+                    if (npcDoc.IsObject() &&
+                        npcDoc.HasMember("preset") &&
+                        npcDoc["preset"].IsString() &&
+                        npcDoc["preset"].GetString() == activePresetName) {
                         std::string filename = entry.path().stem().string();
-                        RE::TESNPC* targetNPC = nullptr;
-                        if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) targetNPC = edidForm->As<RE::TESNPC>();
-                        else {
-                            try { RE::FormID id = std::stoul(filename, nullptr, 16); if (auto f = RE::TESForm::LookupByID(id)) targetNPC = f->As<RE::TESNPC>(); }
-                            catch (...) {}
-                        }
+                        RE::TESNPC* targetNPC =
+                            LookupNPCFromConfigName(filename);
                         if (targetNPC) {
-                            Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
+                            if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
+                                std::string originalJSON;
+                                CaptureVanillaState(targetNPC, originalJSON);
+                                g_vanillaNPCStates[targetNPC->GetFormID()] = originalJSON;
+                            }
+
+                            rapidjson::Document targetOriginal;
+                            targetOriginal.Parse(
+                                g_vanillaNPCStates[targetNPC->GetFormID()].c_str());
+                            rapidjson::Document targetEdited;
+                            ExtractNPCEditDocument(npcDoc, targetEdited);
+                            rapidjson::Document effective;
+                            BuildEffectiveNPCDocument(
+                                targetOriginal,
+                                targetEdited,
+                                doc,
+                                effective);
+                            Manager::ApplyNPCCustomizationFromJSON(targetNPC, effective);
+                            Manager::GetSingleton()->RegisterAffectedNPC(
+                                targetNPC->GetFormID(),
+                                "");
+                            if (g_presetReturnActor &&
+                                g_presetReturnActor->GetActorBase() == targetNPC) {
+                                Manager::ApplyActorCustomizationFromJSON(
+                                    g_presetReturnActor,
+                                    effective);
+                            }
                         }
                     }
                 }
@@ -769,24 +1151,16 @@ void SaveData() {
 
 void ApplyNPC() {
     if (!g_currentNPC) return;
-    rapidjson::Document doc;
+    UpdateNPCEditStateFromUI();
 
-    if (!ui_linkedPreset.empty()) {
-        std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
-        FILE* fp = nullptr;
-        fopen_s(&fp, pPath.c_str(), "rb");
-        if (fp) {
-            char readBuffer[65536];
-            rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-            doc.ParseStream(is);
-            fclose(fp);
-        }
-    }
-    else {
-        GenerateJSONFromUI(doc);
-    }
-
-    Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
+    rapidjson::Document effective;
+    BuildEffectiveNPCDocument(
+        g_originalNPCState,
+        g_npcEditState,
+        g_activePresetState,
+        effective);
+    Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, effective);
+    ParseJSONToUI(effective);
 
     // Se houver um Ator carregado no mundo e a vida mudar, atualizamos instantaneamente
     if (g_currentActor) {
@@ -819,11 +1193,11 @@ void ApplyNPC() {
 }
 
 void RevertNPC() {
-    if (!g_currentNPC || !originalEngineState.IsObject()) return;
-    ui_linkedPreset = "";
-    Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, originalEngineState);
-    LoadNPCToUI(g_currentNPC, g_currentActor);
-    if (g_currentActor) g_currentActor->EvaluatePackage(false, true);
+    if (!g_currentNPC) return;
+    auto* npc = g_currentNPC;
+    auto* actor = g_currentActor;
+    LoadNPCToUI(npc, actor);
+    ApplyNPC();
 }
 
 void RestoreDefaultNPC() {
@@ -834,6 +1208,8 @@ void RestoreDefaultNPC() {
 
     if (std::filesystem::exists(filePath)) std::filesystem::remove(filePath);
     ui_linkedPreset = "";
+    Manager::GetSingleton()->UnregisterAffectedNPC(
+        g_currentNPC->GetFormID());
 
     if (g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
         rapidjson::Document doc;
@@ -847,13 +1223,62 @@ void RestoreDefaultNPC() {
     if (g_currentActor) g_currentActor->EvaluatePackage(false, true);
 }
 
+void UnlinkPreset() {
+    if (ui_linkedPreset.empty()) return;
+
+    UpdateNPCEditStateFromUI();
+    ui_linkedPreset = "";
+    g_activePresetState.SetObject();
+    SetAllFieldSources(FieldSource::kEdited);
+
+    rapidjson::Document effective;
+    BuildEffectiveNPCDocument(
+        g_originalNPCState,
+        g_npcEditState,
+        g_activePresetState,
+        effective);
+    ParseJSONToUI(effective);
+}
+
 
 
 // ==========================================
 // MENUS UI PRINCIPAIS
 // ==========================================
+bool DrawFieldSourceControl(std::string_view groupKey, const char* label) {
+    const bool linkedNPC = !ui_linkedPreset.empty() && !isEditingPreset;
+    if (!isEditingPreset && !linkedNPC) return true;
+
+    const char* sourceItems[] = {
+        GetLoc("source.original", "Original"),
+        GetLoc("source.edited", "Edited"),
+        GetLoc("source.preset", "Preset")
+    };
+
+    int sourceIndex = static_cast<int>(GetFieldSource(groupKey));
+    const std::string comboLabel =
+        std::format("{}##source_{}", label, groupKey);
+
+    ImGuiMCP::SetNextItemWidth(220.0f);
+    if (linkedNPC) ImGuiMCP::BeginDisabled();
+    if (ImGuiMCP::Combo(
+            comboLabel.c_str(),
+            &sourceIndex,
+            sourceItems,
+            static_cast<int>(std::size(sourceItems)))) {
+        ui_fieldSources[std::string(groupKey)] =
+            static_cast<FieldSource>(sourceIndex);
+    }
+    if (linkedNPC) ImGuiMCP::EndDisabled();
+
+    if (isEditingPreset) {
+        return GetFieldSource(groupKey) == FieldSource::kPreset;
+    }
+    return GetFieldSource(groupKey) == FieldSource::kEdited;
+}
+
 void DrawMainEditorUI() {
-    bool isLocked = (!ui_linkedPreset.empty() && !isEditingPreset);
+    bool isLinked = (!ui_linkedPreset.empty() && !isEditingPreset);
     bool isDirty = HasUnsavedChanges();
 
     if (!isEditingPreset && ImGuiMCP::Button(GetLoc("btn.apply", "Apply in-game"))) { ApplyNPC(); }
@@ -887,9 +1312,9 @@ void DrawMainEditorUI() {
     }
     ImGuiMCP::Separator();
 
-    if (isLocked) {
+    if (isLinked) {
         ImGuiMCP::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, GetLoc("text.locked_preset", "This NPC is locked and using PRESET: %s"), ui_linkedPreset.c_str());
-        if (ImGuiMCP::Button(GetLoc("btn.unlink", "Unlink Preset (Free Edit)"))) ui_linkedPreset = "";
+        if (ImGuiMCP::Button(GetLoc("btn.unlink", "Unlink Preset (Free Edit)"))) UnlinkPreset();
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button(GetLoc("btn.edit_preset", "Edit this Preset"))) LoadPresetToUI(ui_linkedPreset);
         ImGuiMCP::Separator();
@@ -910,9 +1335,11 @@ void DrawMainEditorUI() {
                 }
                 else {
                     nameExistsError = false;
+                    UpdateNPCEditStateFromUI();
                     std::string backupName = activePresetName;
                     bool backupEdit = isEditingPreset;
 
+                    SetAllFieldSources(FieldSource::kPreset);
                     activePresetName = newPresetName;
                     isEditingPreset = true;
                     SaveData();
@@ -933,26 +1360,34 @@ void DrawMainEditorUI() {
         if (!ui_availablePresets.empty()) {
             ImGuiMCP::Text("%s", GetLoc("text.apply_existing", "Apply Existing Preset:")); ImGuiMCP::SameLine();
             static int s_presetIdx = 0;
+            s_presetIdx = std::clamp(
+                s_presetIdx,
+                0,
+                static_cast<int>(ui_availablePresets.size()) - 1);
             std::vector<const char*> presetCStrs;
             for (const auto& p : ui_availablePresets) presetCStrs.push_back(p.c_str());
             ImGuiMCP::SetNextItemWidth(200.0f);
             ImGuiMCP::Combo("##PresetCombo", &s_presetIdx, presetCStrs.data(), static_cast<int>(presetCStrs.size()));
             ImGuiMCP::SameLine();
             if (ImGuiMCP::Button(GetLoc("btn.apply_preset", "Apply"))) {
-                ui_linkedPreset = ui_availablePresets[s_presetIdx];
-                std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
-                FILE* fp = nullptr;
-                fopen_s(&fp, pPath.c_str(), "rb");
-                if (fp) {
-                    char readBuffer[65536];
-                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                    rapidjson::Document doc;
-                    doc.ParseStream(is);
-                    fclose(fp);
-                    ParseJSONToUI(doc);
+                UpdateNPCEditStateFromUI();
+                const std::string selectedPreset =
+                    ui_availablePresets[s_presetIdx];
+                const std::string pPath =
+                    std::format("{}/{}.json", PresetsPath, selectedPreset);
+                if (ReadJSONDocument(pPath, g_activePresetState)) {
+                    ui_linkedPreset = selectedPreset;
+                    LoadFieldSourcesFromPreset(g_activePresetState);
+                    rapidjson::Document effective;
+                    BuildEffectiveNPCDocument(
+                        g_originalNPCState,
+                        g_npcEditState,
+                        g_activePresetState,
+                        effective);
+                    ParseJSONToUI(effective);
+                    SaveData();
+                    ApplyNPC();
                 }
-                SaveData();
-                ApplyNPC();
             }
         }
         ImGuiMCP::Separator();
@@ -960,100 +1395,127 @@ void DrawMainEditorUI() {
 
     // --- PAINEL DE ATRIBUTOS BASE ---
     ImGuiMCP::Text("%s", GetLoc("text.base_attr", "Base Attributes & Offsets"));
-    if (isLocked) ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.locked", "[LOCKED]"));
+    const bool healthEditable = DrawFieldSourceControl("health", GetLoc("source.health", "Health Source"));
+    ImGuiMCP::BeginDisabled(!healthEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.health", "Health"), &ui_health, 1.0f, 10.0f, "%.0f");
+    ImGuiMCP::SameLine();
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputInt(GetLoc("ui.health_offset", "Health Offset"), &ui_healthOffset, 1, 10);
+    ImGuiMCP::EndDisabled();
+
+    const bool magickaEditable = DrawFieldSourceControl("magicka", GetLoc("source.magicka", "Magicka Source"));
+    ImGuiMCP::BeginDisabled(!magickaEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.magicka", "Magicka"), &ui_magicka, 1.0f, 10.0f, "%.0f");
+    ImGuiMCP::SameLine();
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputInt(GetLoc("ui.magicka_offset", "Magicka Offset"), &ui_magickaOffset, 1, 10);
+    ImGuiMCP::EndDisabled();
+
+    const bool staminaEditable = DrawFieldSourceControl("stamina", GetLoc("source.stamina", "Stamina Source"));
+    ImGuiMCP::BeginDisabled(!staminaEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.stamina", "Stamina"), &ui_stamina, 1.0f, 10.0f, "%.0f");
+    ImGuiMCP::SameLine();
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputInt(GetLoc("ui.stamina_offset", "Stamina Offset"), &ui_staminaOffset, 1, 10);
+    ImGuiMCP::EndDisabled();
+
+    ImGuiMCP::Spacing();
+    ImGuiMCP::Text("%s", GetLoc("text.acbs", "Level & Configuration (ACBS)"));
+    const bool levelEditable = DrawFieldSourceControl("level", GetLoc("source.level", "Level Source"));
+    ImGuiMCP::BeginDisabled(!levelEditable);
+    ImGuiMCP::Checkbox(GetLoc("ui.auto_calc", "Auto-Calc Stats"), &ui_calcStats);
+    ImGuiMCP::SameLine();
+    if (ui_calcStats) {
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat(GetLoc("ui.level_mult", "Level Mult"), &ui_levelMult, 0.05f, 0.1f, "%.3f");
+    }
     else {
         ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.health", "Health"), &ui_health, 1.0f, 10.0f, "%.0f");
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputInt(GetLoc("ui.health_offset", "Health Offset"), &ui_healthOffset, 1, 10);
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.magicka", "Magicka"), &ui_magicka, 1.0f, 10.0f, "%.0f");
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputInt(GetLoc("ui.magicka_offset", "Magicka Offset"), &ui_magickaOffset, 1, 10);
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.stamina", "Stamina"), &ui_stamina, 1.0f, 10.0f, "%.0f");
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputInt(GetLoc("ui.stamina_offset", "Stamina Offset"), &ui_staminaOffset, 1, 10);
-
-        ImGuiMCP::Spacing();
-        ImGuiMCP::Text("%s", GetLoc("text.acbs", "Level & Configuration (ACBS)"));
-
-        ImGuiMCP::Checkbox(GetLoc("ui.auto_calc", "Auto-Calc Stats"), &ui_calcStats);
-        ImGuiMCP::SameLine();
-        if (ui_calcStats) {
-            ImGuiMCP::SetNextItemWidth(200.0f);
-            ImGuiMCP::InputFloat(GetLoc("ui.level_mult", "Level Mult"), &ui_levelMult, 0.05f, 0.1f, "%.3f");
-        }
-        else {
-            ImGuiMCP::SetNextItemWidth(200.0f);
-            int lvl = ui_level;
-            if (ImGuiMCP::InputInt(GetLoc("ui.level", "Level"), &lvl)) ui_level = static_cast<uint16_t>(std::max(1, lvl));
-        }
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        int cMin = ui_calcMinLevel;
-        if (ImGuiMCP::InputInt(GetLoc("ui.calc_min", "Calc Min Level"), &cMin)) ui_calcMinLevel = static_cast<uint16_t>(std::max(0, cMin));
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        int cMax = ui_calcMaxLevel;
-        if (ImGuiMCP::InputInt(GetLoc("ui.calc_max", "Calc Max Level"), &cMax)) ui_calcMaxLevel = static_cast<uint16_t>(std::max(0, cMax));
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        int spd = ui_speedMult;
-        if (ImGuiMCP::InputInt(GetLoc("ui.speed_mult", "Speed Multiplier"), &spd)) ui_speedMult = static_cast<uint16_t>(std::max(0, spd));
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        int disp = ui_dispositionBase;
-        if (ImGuiMCP::InputInt(GetLoc("ui.disposition", "Disposition Base"), &disp)) ui_dispositionBase = static_cast<uint16_t>(std::max(0, disp));
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputInt(GetLoc("ui.bleedout", "Bleedout Override"), &ui_bleedoutOverride, 1);
-
-        ImGuiMCP::Spacing();
-        ImGuiMCP::Text("%s", GetLoc("text.base_flags", "Base Flags"));
-        ImGuiMCP::Checkbox(GetLoc("ui.essential", "Essential"), &ui_isEssential);
-        ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox(GetLoc("ui.protected", "Protected"), &ui_isProtected);
-        ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox(GetLoc("ui.unique", "Unique"), &ui_isUnique);
-        ImGuiMCP::SameLine();
-        ImGuiMCP::Checkbox(GetLoc("ui.stealth_meter", "Doesn't affect stealth meter"), &ui_doesntAffectStealthMeter);
+        int lvl = ui_level;
+        if (ImGuiMCP::InputInt(GetLoc("ui.level", "Level"), &lvl)) ui_level = static_cast<uint16_t>(std::max(1, lvl));
     }
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    int cMin = ui_calcMinLevel;
+    if (ImGuiMCP::InputInt(GetLoc("ui.calc_min", "Calc Min Level"), &cMin)) ui_calcMinLevel = static_cast<uint16_t>(std::max(0, cMin));
+    ImGuiMCP::SameLine();
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    int cMax = ui_calcMaxLevel;
+    if (ImGuiMCP::InputInt(GetLoc("ui.calc_max", "Calc Max Level"), &cMax)) ui_calcMaxLevel = static_cast<uint16_t>(std::max(0, cMax));
+    ImGuiMCP::EndDisabled();
+
+    const bool speedEditable = DrawFieldSourceControl("speed", GetLoc("source.speed", "Speed Source"));
+    ImGuiMCP::BeginDisabled(!speedEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    int spd = ui_speedMult;
+    if (ImGuiMCP::InputInt(GetLoc("ui.speed_mult", "Speed Multiplier"), &spd)) ui_speedMult = static_cast<uint16_t>(std::max(0, spd));
+    ImGuiMCP::EndDisabled();
+
+    const bool dispositionEditable = DrawFieldSourceControl("disposition", GetLoc("source.disposition", "Disposition Source"));
+    ImGuiMCP::BeginDisabled(!dispositionEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    int disp = ui_dispositionBase;
+    if (ImGuiMCP::InputInt(GetLoc("ui.disposition", "Disposition Base"), &disp)) ui_dispositionBase = static_cast<uint16_t>(std::max(0, disp));
+    ImGuiMCP::EndDisabled();
+
+    const bool bleedoutEditable = DrawFieldSourceControl("bleedout", GetLoc("source.bleedout", "Bleedout Source"));
+    ImGuiMCP::BeginDisabled(!bleedoutEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputInt(GetLoc("ui.bleedout", "Bleedout Override"), &ui_bleedoutOverride, 1);
+    ImGuiMCP::EndDisabled();
+
+    ImGuiMCP::Spacing();
+    ImGuiMCP::Text("%s", GetLoc("text.base_flags", "Base Flags"));
+    const bool flagsEditable = DrawFieldSourceControl("flags", GetLoc("source.flags", "Flags Source"));
+    ImGuiMCP::BeginDisabled(!flagsEditable);
+    ImGuiMCP::Checkbox(GetLoc("ui.essential", "Essential"), &ui_isEssential);
+    ImGuiMCP::SameLine();
+    ImGuiMCP::Checkbox(GetLoc("ui.protected", "Protected"), &ui_isProtected);
+    ImGuiMCP::SameLine();
+    ImGuiMCP::Checkbox(GetLoc("ui.unique", "Unique"), &ui_isUnique);
+    ImGuiMCP::SameLine();
+    ImGuiMCP::Checkbox(GetLoc("ui.stealth_meter", "Doesn't affect stealth meter"), &ui_doesntAffectStealthMeter);
+    ImGuiMCP::EndDisabled();
+
     ImGuiMCP::Separator();
     ImGuiMCP::Spacing();
     ImGuiMCP::Text("%s", GetLoc("text.multipliers", "Actor Multipliers (Instance Values)"));
-    if (isLocked) {
-        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.locked", "[LOCKED]"));
-    }
-    else {
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.atk_dmg_mult", "Attack Damage Mult"), &ui_attackDamageMult, 0.1f, 1.0f, "%.2f");
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.heal_rate_mult", "Heal Rate Mult"), &ui_healRateMult, 1.0f, 10.0f, "%.2f");
-
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.mag_rate_mult", "Magicka Rate Mult"), &ui_magickaRateMult, 1.0f, 10.0f, "%.2f");
-        ImGuiMCP::SameLine();
-        ImGuiMCP::SetNextItemWidth(200.0f);
-        ImGuiMCP::InputFloat(GetLoc("ui.stam_rate_mult", "Stamina Rate Mult"), &ui_staminaRateMult, 1.0f, 10.0f, "%.2f");
-    }
+    const bool attackEditable = DrawFieldSourceControl("attackDamageMult", GetLoc("source.attack", "Attack Damage Source"));
+    ImGuiMCP::BeginDisabled(!attackEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.atk_dmg_mult", "Attack Damage Mult"), &ui_attackDamageMult, 0.1f, 1.0f, "%.2f");
+    ImGuiMCP::EndDisabled();
+    const bool healRateEditable = DrawFieldSourceControl("healRateMult", GetLoc("source.heal_rate", "Health Regen Source"));
+    ImGuiMCP::BeginDisabled(!healRateEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.heal_rate_mult", "Health Rate Mult"), &ui_healRateMult, 1.0f, 10.0f, "%.2f");
+    ImGuiMCP::EndDisabled();
+    const bool magickaRateEditable = DrawFieldSourceControl("magickaRateMult", GetLoc("source.magicka_rate", "Magicka Regen Source"));
+    ImGuiMCP::BeginDisabled(!magickaRateEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.mag_rate_mult", "Magicka Rate Mult"), &ui_magickaRateMult, 1.0f, 10.0f, "%.2f");
+    ImGuiMCP::EndDisabled();
+    const bool staminaRateEditable = DrawFieldSourceControl("staminaRateMult", GetLoc("source.stamina_rate", "Stamina Regen Source"));
+    ImGuiMCP::BeginDisabled(!staminaRateEditable);
+    ImGuiMCP::SetNextItemWidth(200.0f);
+    ImGuiMCP::InputFloat(GetLoc("ui.stam_rate_mult", "Stamina Rate Mult"), &ui_staminaRateMult, 1.0f, 10.0f, "%.2f");
+    ImGuiMCP::EndDisabled();
     ImGuiMCP::Separator();
 
     // --- PAINEL DE CLASSE E COMBATE ---
     ImGuiMCP::Text("%s", GetLoc("text.class_combat", "Class & Combat Style"));
     static int s_classIdx = 0, s_combatIdx = 0;
-    DrawDropdown(GetLoc("ui.class", "Class"), "Class", &ui_class, s_classIdx, isLocked, 300.0f);
-    DrawDropdown(GetLoc("ui.combat_style", "Combat Style"), "CombatStyle", &ui_combatStyle, s_combatIdx, isLocked, 300.0f);
+    const bool classEditable = DrawFieldSourceControl("class", GetLoc("source.class", "Class Source"));
+    DrawDropdown(GetLoc("ui.class", "Class"), "Class", &ui_class, s_classIdx, !classEditable, 300.0f);
+    const bool combatStyleEditable = DrawFieldSourceControl("combatStyle", GetLoc("source.combat_style", "Combat Style Source"));
+    DrawDropdown(GetLoc("ui.combat_style", "Combat Style"), "CombatStyle", &ui_combatStyle, s_combatIdx, !combatStyleEditable, 300.0f);
     ImGuiMCP::Separator();
 
     // --- PAINEL DE SKILLS E OFFSETS ---
     ImGuiMCP::Text("%s", GetLoc("text.skills", "Skills (Base & Offsets)"));
+    const bool skillsEditable = DrawFieldSourceControl("skills", GetLoc("source.skills", "Skills Source"));
     if (ImGuiMCP::BeginTable("SkillsTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg)) {
         ImGuiMCP::TableSetupColumn(GetLoc("col.skill", "Skill"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.value", "Value"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
@@ -1067,7 +1529,7 @@ void DrawMainEditorUI() {
 
             ImGuiMCP::TableSetColumnIndex(1);
             ImGuiMCP::PushID(i);
-            if (isLocked) ImGuiMCP::Text("%d", ui_skills[i]);
+            if (!skillsEditable) ImGuiMCP::Text("%d", ui_skills[i]);
             else {
                 int skillVal = ui_skills[i];
                 ImGuiMCP::SetNextItemWidth(200.0f);
@@ -1081,7 +1543,7 @@ void DrawMainEditorUI() {
 
             ImGuiMCP::TableSetColumnIndex(2);
             ImGuiMCP::PushID(i + 100);
-            if (isLocked) ImGuiMCP::Text("%d", ui_skillOffsets[i]);
+            if (!skillsEditable) ImGuiMCP::Text("%d", ui_skillOffsets[i]);
             else {
                 int offsetVal = ui_skillOffsets[i];
                 ImGuiMCP::SetNextItemWidth(200.0f);
@@ -1099,6 +1561,7 @@ void DrawMainEditorUI() {
 
     // --- PAINEL DE PERKS ---
     ImGuiMCP::Text("%s", GetLoc("text.perks", "Perks"));
+    const bool perksEditable = DrawFieldSourceControl("perks", GetLoc("source.perks", "Perks Source"));
     if (ImGuiMCP::BeginTable("PerksTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
         ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.perk_edid", "Perk EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
@@ -1111,13 +1574,13 @@ void DrawMainEditorUI() {
             ImGuiMCP::TableNextRow();
 
             ImGuiMCP::TableSetColumnIndex(0);
-            if (!isLocked && ImGuiMCP::Button(" X ")) to_remove_perk = static_cast<int>(i);
+            if (perksEditable && ImGuiMCP::Button(GetLoc("btn.remove_short", " X "))) to_remove_perk = static_cast<int>(i);
 
             ImGuiMCP::TableSetColumnIndex(1);
             ImGuiMCP::Text("%s", ui_perks[i].perk ? clib_util::editorID::get_editorID(ui_perks[i].perk).c_str() : "Null");
 
             ImGuiMCP::TableSetColumnIndex(2);
-            if (isLocked) {
+            if (!perksEditable) {
                 ImGuiMCP::Text("%d", ui_perks[i].rank);
             }
             else {
@@ -1129,7 +1592,7 @@ void DrawMainEditorUI() {
         ImGuiMCP::EndTable();
         if (to_remove_perk != -1) ui_perks.erase(ui_perks.begin() + to_remove_perk);
     }
-    if (!isLocked) {
+    if (perksEditable) {
         static RE::BGSPerk* newPerk = nullptr;
         static int s_newPerkIdx = 0;
         DrawDropdown(GetLoc("ui.add_perk", "Add Perk"), "Perk", &newPerk, s_newPerkIdx, false, 300.0f);
@@ -1145,6 +1608,7 @@ void DrawMainEditorUI() {
 
     // --- PAINEL DE FACTIONS ---
     ImGuiMCP::Text("%s", GetLoc("text.factions", "Factions"));
+    const bool factionsEditable = DrawFieldSourceControl("factions", GetLoc("source.factions", "Factions Source"));
     if (ImGuiMCP::BeginTable("FactionsTable", 3, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
         ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.faction_edid", "Faction EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
@@ -1157,13 +1621,13 @@ void DrawMainEditorUI() {
             ImGuiMCP::TableNextRow();
 
             ImGuiMCP::TableSetColumnIndex(0);
-            if (!isLocked && ImGuiMCP::Button(" X ")) to_remove_faction = static_cast<int>(i);
+            if (factionsEditable && ImGuiMCP::Button(GetLoc("btn.remove_short", " X "))) to_remove_faction = static_cast<int>(i);
 
             ImGuiMCP::TableSetColumnIndex(1);
             ImGuiMCP::Text("%s", ui_factions[i].faction ? clib_util::editorID::get_editorID(ui_factions[i].faction).c_str() : "Null");
 
             ImGuiMCP::TableSetColumnIndex(2);
-            if (isLocked) {
+            if (!factionsEditable) {
                 ImGuiMCP::Text("%d", ui_factions[i].rank);
             }
             else {
@@ -1175,7 +1639,7 @@ void DrawMainEditorUI() {
         ImGuiMCP::EndTable();
         if (to_remove_faction != -1) ui_factions.erase(ui_factions.begin() + to_remove_faction);
     }
-    if (!isLocked) {
+    if (factionsEditable) {
         static RE::TESFaction* newFaction = nullptr;
         static int s_newFactionIdx = 0;
         DrawDropdown(GetLoc("ui.add_faction", "Add Faction"), "Faction", &newFaction, s_newFactionIdx, false, 300.0f);
@@ -1189,6 +1653,7 @@ void DrawMainEditorUI() {
     }
 
     ImGuiMCP::Text("%s", GetLoc("text.spells", "Spells"));
+    const bool spellsEditable = DrawFieldSourceControl("spells", GetLoc("source.spells", "Spells Source"));
     if (ImGuiMCP::BeginTable("SpellsTable", 2, ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable)) {
         ImGuiMCP::TableSetupColumn(GetLoc("col.action", "Action"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.spell_edid", "Spell EditorID"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
@@ -1200,7 +1665,7 @@ void DrawMainEditorUI() {
             ImGuiMCP::TableNextRow();
 
             ImGuiMCP::TableSetColumnIndex(0);
-            if (!isLocked && ImGuiMCP::Button(" X ")) to_remove_spell = static_cast<int>(i);
+            if (spellsEditable && ImGuiMCP::Button(GetLoc("btn.remove_short", " X "))) to_remove_spell = static_cast<int>(i);
 
             ImGuiMCP::TableSetColumnIndex(1);
             ImGuiMCP::Text("%s", ui_spells[i] ? clib_util::editorID::get_editorID(ui_spells[i]).c_str() : "Null");
@@ -1210,7 +1675,7 @@ void DrawMainEditorUI() {
         ImGuiMCP::EndTable();
         if (to_remove_spell != -1) ui_spells.erase(ui_spells.begin() + to_remove_spell);
     }
-    if (!isLocked) {
+    if (spellsEditable) {
         static RE::SpellItem* newSpell = nullptr;
         static int s_newSpellIdx = 0;
         DrawDropdown(GetLoc("ui.add_spell", "Add Spell"), "Spell", &newSpell, s_newSpellIdx, false, 300.0f);
@@ -1256,12 +1721,18 @@ void NSettings::Presets() {
     }
 
     auto tableFlags = ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable;
+    static bool openManageModal = false;
+    static std::string presetToManage = "";
+    static std::set<RE::FormID> selectedNPCs;
+    static std::set<RE::FormID> originalSelectedNPCs;
+    static std::map<RE::FormID, std::string> originalConfigNames;
     static bool openDeleteModal = false;
     static std::string presetToDelete = "";
     static bool deleteLinkedNPCs = false;
 
-    if (ImGuiMCP::BeginTable("PresetDB", 5, tableFlags)) {
+    if (ImGuiMCP::BeginTable("PresetDB", 6, tableFlags)) {
         ImGuiMCP::TableSetupColumn(GetLoc("col.edit", "Edit"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGuiMCP::TableSetupColumn(GetLoc("col.manage", "Manage"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.export", "Export"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.delete", "Delete"), ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn(GetLoc("col.preset_name", "Preset Name"), ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
@@ -1276,6 +1747,33 @@ void NSettings::Presets() {
             if (ImGuiMCP::Button(GetLoc("col.edit", "Edit"))) LoadPresetToUI(pName);
 
             ImGuiMCP::TableSetColumnIndex(1);
+            if (ImGuiMCP::Button(GetLoc("col.manage", "Manage"))) {
+                presetToManage = pName;
+                selectedNPCs.clear();
+                originalSelectedNPCs.clear();
+                originalConfigNames.clear();
+
+                const auto& npcList =
+                    Manager::GetSingleton()->GetList("NPC");
+                for (const auto& configName : presetUsageDB[pName]) {
+                    for (const auto& item : npcList) {
+                        if (EqualsCaseInsensitive(
+                                item.editorID,
+                                configName) ||
+                            EqualsCaseInsensitive(
+                                std::format("{:08X}", item.formID),
+                                configName)) {
+                            selectedNPCs.insert(item.formID);
+                            originalSelectedNPCs.insert(item.formID);
+                            originalConfigNames[item.formID] = configName;
+                            break;
+                        }
+                    }
+                }
+                openManageModal = true;
+            }
+
+            ImGuiMCP::TableSetColumnIndex(2);
             if (isEditingPreset && activePresetName == pName && HasUnsavedChanges()) {
                 ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "%s", GetLoc("text.save_first", "Save First"));
             }
@@ -1283,7 +1781,7 @@ void NSettings::Presets() {
                 if (ImGuiMCP::Button(GetLoc("col.export", "Export"))) ExportPresetAsZip(pName);
             }
 
-            ImGuiMCP::TableSetColumnIndex(2);
+            ImGuiMCP::TableSetColumnIndex(3);
             ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.8f, 0.2f, 0.2f, 1.0f });
             if (ImGuiMCP::Button(GetLoc("col.delete", "Delete"))) {
                 presetToDelete = pName;
@@ -1292,10 +1790,10 @@ void NSettings::Presets() {
             }
             ImGuiMCP::PopStyleColor();
 
-            ImGuiMCP::TableSetColumnIndex(3);
+            ImGuiMCP::TableSetColumnIndex(4);
             ImGuiMCP::Text("%s", pName.c_str());
 
-            ImGuiMCP::TableSetColumnIndex(4);
+            ImGuiMCP::TableSetColumnIndex(5);
             std::string users = "";
             for (const auto& u : presetUsageDB[pName]) users += u + ", ";
             if (!users.empty()) { users.pop_back(); users.pop_back(); }
@@ -1304,6 +1802,317 @@ void NSettings::Presets() {
             ImGuiMCP::PopID();
         }
         ImGuiMCP::EndTable();
+    }
+
+    const char* popupManageLabel =
+        GetLoc("modal.manage_links", "Manage Preset Links");
+    if (openManageModal) ImGuiMCP::OpenPopup(popupManageLabel);
+
+    if (ImGuiMCP::BeginPopupModal(
+            popupManageLabel,
+            &openManageModal,
+            ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGuiMCP::Text(
+            GetLoc(
+                "text.manage_npcs",
+                "Manage NPCs linked to preset: %s"),
+            presetToManage.c_str());
+        ImGuiMCP::Separator();
+
+        static char modalFilter[256] = "";
+        ImGuiMCP::SetNextItemWidth(300.0f);
+        ImGuiMCP::InputText(
+            GetLoc("ui.search_npc", "Search NPC"),
+            modalFilter,
+            sizeof(modalFilter));
+
+        const auto& npcList = Manager::GetSingleton()->GetList("NPC");
+        std::string search(modalFilter);
+        std::transform(
+            search.begin(),
+            search.end(),
+            search.begin(),
+            [](unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+
+        std::vector<std::size_t> filteredIndices;
+        for (std::size_t index = 0; index < npcList.size(); ++index) {
+            if (!search.empty()) {
+                std::string name = npcList[index].name;
+                std::string editorID = npcList[index].editorID;
+                std::transform(
+                    name.begin(),
+                    name.end(),
+                    name.begin(),
+                    [](unsigned char character) {
+                        return static_cast<char>(std::tolower(character));
+                    });
+                std::transform(
+                    editorID.begin(),
+                    editorID.end(),
+                    editorID.begin(),
+                    [](unsigned char character) {
+                        return static_cast<char>(std::tolower(character));
+                    });
+                if (name.find(search) == std::string::npos &&
+                    editorID.find(search) == std::string::npos) {
+                    continue;
+                }
+            }
+            filteredIndices.push_back(index);
+        }
+
+        ImGuiMCP::Text(
+            GetLoc("text.npcs_found", "NPCs found: %d"),
+            static_cast<int>(filteredIndices.size()));
+
+        ImGuiMCP::BeginChild(
+            "NPCPresetManageList",
+            ImGuiMCP::ImVec2(500, 300),
+            true);
+        static auto manageClipper =
+            ImGuiMCP::ImGuiListClipperManager::Create();
+        ImGuiMCP::ImGuiListClipperManager::Begin(
+            manageClipper,
+            static_cast<int>(filteredIndices.size()),
+            -1.0f);
+        while (ImGuiMCP::ImGuiListClipperManager::Step(manageClipper)) {
+            for (int visibleIndex = manageClipper->DisplayStart;
+                 visibleIndex < manageClipper->DisplayEnd;
+                 ++visibleIndex) {
+                const auto listIndex = filteredIndices[visibleIndex];
+                const auto& item = npcList[listIndex];
+                bool selected = selectedNPCs.contains(item.formID);
+
+                ImGuiMCP::PushID(static_cast<int>(item.formID));
+                const std::string label = std::format(
+                    "{} [{:08X}]",
+                    item.name.empty() ? item.editorID : item.name,
+                    item.formID);
+                if (ImGuiMCP::Checkbox(label.c_str(), &selected)) {
+                    if (selected) selectedNPCs.insert(item.formID);
+                    else selectedNPCs.erase(item.formID);
+                }
+                ImGuiMCP::PopID();
+            }
+        }
+        ImGuiMCP::ImGuiListClipperManager::End(manageClipper);
+        ImGuiMCP::EndChild();
+
+        ImGuiMCP::Separator();
+        if (ImGuiMCP::Button(
+                GetLoc("btn.check_all_visible", "Check All Visible"))) {
+            for (const auto index : filteredIndices) {
+                selectedNPCs.insert(npcList[index].formID);
+            }
+        }
+        ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button(
+                GetLoc("btn.uncheck_all", "Uncheck All"))) {
+            selectedNPCs.clear();
+        }
+
+        ImGuiMCP::Spacing();
+        const std::string saveLabel = std::format(
+            "{} ({})",
+            GetLoc("btn.save_changes", "Save Changes"),
+            selectedNPCs.size());
+        if (ImGuiMCP::Button(
+                saveLabel.c_str(),
+                ImGuiMCP::ImVec2(180, 0))) {
+            rapidjson::Document presetDocument;
+            const std::string presetPath =
+                std::format("{}/{}.json", PresetsPath, presetToManage);
+
+            if (ReadJSONDocument(presetPath, presetDocument)) {
+                FieldSourceMap presetSources;
+                LoadFieldSourcesFromPreset(
+                    presetDocument,
+                    presetSources);
+
+                for (const auto formID : originalSelectedNPCs) {
+                    if (selectedNPCs.contains(formID)) continue;
+
+                    auto* npc =
+                        RE::TESForm::LookupByID<RE::TESNPC>(formID);
+                    if (!npc) continue;
+
+                    const auto configNameIt =
+                        originalConfigNames.find(formID);
+                    const std::string configName =
+                        configNameIt != originalConfigNames.end() ?
+                        configNameIt->second :
+                        GetNPCConfigName(npc);
+                    const std::string npcPath =
+                        std::format("{}/{}.json", NPCPath, configName);
+
+                    rapidjson::Document storedNPC;
+                    if (!ReadJSONDocument(npcPath, storedNPC)) {
+                        storedNPC.SetObject();
+                    }
+                    if (storedNPC.HasMember("preset")) {
+                        storedNPC.RemoveMember("preset");
+                    }
+
+                    EnsureOriginalNPCState(npc);
+                    rapidjson::Document original;
+                    original.Parse(
+                        g_vanillaNPCStates[formID].c_str());
+                    rapidjson::Document edited;
+                    ExtractNPCEditDocument(storedNPC, edited);
+                    rapidjson::Document noPreset;
+                    noPreset.SetObject();
+                    FieldSourceMap editedSources;
+                    SetAllFieldSources(
+                        editedSources,
+                        FieldSource::kEdited);
+                    rapidjson::Document effective;
+                    BuildEffectiveNPCDocument(
+                        original,
+                        edited,
+                        noPreset,
+                        editedSources,
+                        effective);
+
+                    bool persisted = false;
+                    if (storedNPC.MemberCount() == 0) {
+                        if (std::filesystem::exists(npcPath)) {
+                            std::error_code error;
+                            std::filesystem::remove(npcPath, error);
+                            persisted = !error;
+                        }
+                        else {
+                            persisted = true;
+                        }
+                    }
+                    else {
+                        persisted =
+                            WriteJSONDocument(npcPath, storedNPC);
+                    }
+                    if (!persisted) {
+                        logger::error(
+                            "Failed to unlink NPC {:08X} from preset '{}'.",
+                            formID,
+                            presetToManage);
+                        continue;
+                    }
+
+                    Manager::ApplyNPCCustomizationFromJSON(
+                        npc,
+                        effective);
+                    if (g_currentActor &&
+                        g_currentActor->GetActorBase() == npc) {
+                        Manager::ApplyActorCustomizationFromJSON(
+                            g_currentActor,
+                            effective);
+                    }
+
+                    if (storedNPC.MemberCount() == 0) {
+                        Manager::GetSingleton()->UnregisterAffectedNPC(
+                            formID);
+                    }
+                    else {
+                        Manager::GetSingleton()->RegisterAffectedNPC(
+                            formID,
+                            "");
+                    }
+                }
+
+                std::filesystem::create_directories(NPCPath);
+                for (const auto formID : selectedNPCs) {
+                    auto* npc =
+                        RE::TESForm::LookupByID<RE::TESNPC>(formID);
+                    if (!npc) continue;
+
+                    EnsureOriginalNPCState(npc);
+                    const auto configNameIt =
+                        originalConfigNames.find(formID);
+                    const std::string configName =
+                        configNameIt != originalConfigNames.end() ?
+                        configNameIt->second :
+                        GetNPCConfigName(npc);
+                    const std::string npcPath =
+                        std::format("{}/{}.json", NPCPath, configName);
+
+                    rapidjson::Document storedNPC;
+                    if (!ReadJSONDocument(npcPath, storedNPC)) {
+                        storedNPC.SetObject();
+                    }
+                    if (storedNPC.HasMember("preset")) {
+                        storedNPC.RemoveMember("preset");
+                    }
+                    storedNPC.AddMember(
+                        "preset",
+                        rapidjson::Value(
+                            presetToManage.c_str(),
+                            storedNPC.GetAllocator()),
+                        storedNPC.GetAllocator());
+
+                    rapidjson::Document original;
+                    original.Parse(
+                        g_vanillaNPCStates[formID].c_str());
+                    rapidjson::Document edited;
+                    ExtractNPCEditDocument(storedNPC, edited);
+                    rapidjson::Document effective;
+                    BuildEffectiveNPCDocument(
+                        original,
+                        edited,
+                        presetDocument,
+                        presetSources,
+                        effective);
+
+                    if (!WriteJSONDocument(npcPath, storedNPC)) {
+                        logger::error(
+                            "Failed to link NPC {:08X} to preset '{}'.",
+                            formID,
+                            presetToManage);
+                        continue;
+                    }
+                    Manager::ApplyNPCCustomizationFromJSON(
+                        npc,
+                        effective);
+                    if (g_currentActor &&
+                        g_currentActor->GetActorBase() == npc) {
+                        Manager::ApplyActorCustomizationFromJSON(
+                            g_currentActor,
+                            effective);
+                    }
+                    Manager::GetSingleton()->RegisterAffectedNPC(
+                        formID,
+                        "");
+                }
+
+                if (g_currentNPC && !isEditingPreset) {
+                    LoadNPCToUI(g_currentNPC, g_currentActor);
+                }
+                needsUsageScan = true;
+                selectedNPCs.clear();
+                originalSelectedNPCs.clear();
+                originalConfigNames.clear();
+                modalFilter[0] = '\0';
+                openManageModal = false;
+                ImGuiMCP::CloseCurrentPopup();
+            }
+            else {
+                logger::error(
+                    "Could not manage NPC links: preset '{}' is invalid or missing.",
+                    presetToManage);
+            }
+        }
+
+        ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button(
+                GetLoc("btn.cancel", "Cancel"),
+                ImGuiMCP::ImVec2(120, 0))) {
+            selectedNPCs.clear();
+            originalSelectedNPCs.clear();
+            originalConfigNames.clear();
+            modalFilter[0] = '\0';
+            openManageModal = false;
+            ImGuiMCP::CloseCurrentPopup();
+        }
+        ImGuiMCP::EndPopup();
     }
 
     // Modal de Delete
@@ -1325,10 +2134,39 @@ void NSettings::Presets() {
                 for (const auto& u : users) {
                     std::string nPath = std::format("{}/{}.json", NPCPath, u);
                     if (std::filesystem::exists(nPath)) std::filesystem::remove(nPath);
+                    if (auto* npc = LookupNPCFromConfigName(u)) {
+                        Manager::GetSingleton()->UnregisterAffectedNPC(
+                            npc->GetFormID());
+                    }
+                }
+            }
+            else if (!users.empty()) {
+                for (const auto& u : users) {
+                    const std::string nPath =
+                        std::format("{}/{}.json", NPCPath, u);
+                    rapidjson::Document npcDocument;
+                    if (!ReadJSONDocument(nPath, npcDocument) ||
+                        !npcDocument.HasMember("preset")) {
+                        continue;
+                    }
+
+                    npcDocument.RemoveMember("preset");
+                    FILE* npcFile = nullptr;
+                    fopen_s(&npcFile, nPath.c_str(), "wb");
+                    if (!npcFile) continue;
+
+                    char writeBuffer[65536];
+                    rapidjson::FileWriteStream output(
+                        npcFile,
+                        writeBuffer,
+                        sizeof(writeBuffer));
+                    rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(output);
+                    npcDocument.Accept(writer);
+                    fclose(npcFile);
                 }
             }
             if (activePresetName == presetToDelete) { activePresetName = ""; isEditingPreset = false; }
-            if (ui_linkedPreset == presetToDelete) ui_linkedPreset = "";
+            if (ui_linkedPreset == presetToDelete) UnlinkPreset();
             needsUsageScan = true;
             openDeleteModal = false;
             ImGuiMCP::CloseCurrentPopup();
@@ -1345,7 +2183,9 @@ void NSettings::NPCList() {
 
     if (npcList.empty()) {
         ImGuiMCP::Text("%s", GetLoc("text.no_npcs", "No NPCs loaded into memory."));
-        if (ImGuiMCP::Button(GetLoc("btn.force_scan", "Force Scan"))) manager->PopulateAllLists();
+        if (ImGuiMCP::Button(GetLoc("btn.force_scan", "Force Scan"))) {
+            logger::debug("[NPCList] Force Scan clicked; list population is handled by DataLoaded/DFG callbacks.");
+        }
         return;
     }
 
@@ -1473,7 +2313,15 @@ void NSettings::NPCMenu() {
         if (ImGuiMCP::Button(GetLoc("btn.exit_preset", "<- Exit Preset Editor"))) {
             isEditingPreset = false;
             activePresetName = "";
-            g_currentNPC = nullptr;
+            if (g_presetReturnNPC) {
+                LoadNPCToUI(g_presetReturnNPC, g_presetReturnActor);
+            }
+            else {
+                g_currentNPC = nullptr;
+                g_currentActor = nullptr;
+            }
+            g_presetReturnNPC = nullptr;
+            g_presetReturnActor = nullptr;
         }
         ImGuiMCP::Separator();
         DrawMainEditorUI();
@@ -1491,6 +2339,54 @@ void NSettings::NPCMenu() {
         }
     }
 }
+
+void NSettings::LoadAndApplyActorCustomizations(RE::Actor* actor) {
+    if (!actor) return;
+    auto* npc = actor->GetActorBase();
+    if (!npc) return;
+
+    std::string editorID = clib_util::editorID::get_editorID(npc);
+    if (editorID.empty()) editorID = std::format("{:08X}", npc->GetFormID());
+
+    const std::string npcPath = std::format("{}/{}.json", NPCPath, editorID);
+    rapidjson::Document storedNPC;
+    if (!ReadJSONDocument(npcPath, storedNPC)) return;
+
+    if (!g_vanillaNPCStates.contains(npc->GetFormID())) {
+        std::string originalJSON;
+        CaptureVanillaState(npc, originalJSON);
+        g_vanillaNPCStates[npc->GetFormID()] = originalJSON;
+    }
+
+    rapidjson::Document original;
+    original.Parse(g_vanillaNPCStates[npc->GetFormID()].c_str());
+    rapidjson::Document edited;
+    ExtractNPCEditDocument(storedNPC, edited);
+    rapidjson::Document preset;
+    preset.SetObject();
+
+    FieldSourceMap sources;
+    SetAllFieldSources(sources, FieldSource::kEdited);
+    if (storedNPC.HasMember("preset") && storedNPC["preset"].IsString()) {
+        const std::string presetPath = std::format(
+            "{}/{}.json",
+            PresetsPath,
+            storedNPC["preset"].GetString());
+        if (ReadJSONDocument(presetPath, preset)) {
+            LoadFieldSourcesFromPreset(preset, sources);
+        }
+    }
+
+    rapidjson::Document effective;
+    BuildEffectiveNPCDocument(
+        original,
+        edited,
+        preset,
+        sources,
+        effective);
+    Manager::ApplyActorCustomizationFromJSON(actor, effective);
+}
+
 void NSettings::Load() {
     logger::info("[Load] Inicializando sistema de arquivos de Stats...");
     std::filesystem::create_directories(NPCPath);
@@ -1525,13 +2421,7 @@ void NSettings::Load() {
     for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
         if (entry.path().extension() == ".json") {
             std::string filename = entry.path().stem().string();
-            RE::TESNPC* targetNPC = nullptr;
-
-            if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) targetNPC = edidForm->As<RE::TESNPC>();
-            else {
-                try { RE::FormID id = std::stoul(filename, nullptr, 16); if (auto f = RE::TESForm::LookupByID(id)) targetNPC = f->As<RE::TESNPC>(); }
-                catch (...) {}
-            }
+            RE::TESNPC* targetNPC = LookupNPCFromConfigName(filename);
             if (!targetNPC) continue;
 
             if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
@@ -1551,17 +2441,42 @@ void NSettings::Load() {
                     fclose(fp);
 
                     if (doc.IsObject()) {
+                        rapidjson::Document original;
+                        original.Parse(
+                            g_vanillaNPCStates[targetNPC->GetFormID()].c_str());
+                        rapidjson::Document edited;
+                        ExtractNPCEditDocument(doc, edited);
+                        rapidjson::Document emptyPreset;
+                        emptyPreset.SetObject();
+                        const rapidjson::Document* selectedPreset =
+                            std::addressof(emptyPreset);
+                        FieldSourceMap sources;
+                        SetAllFieldSources(sources, FieldSource::kEdited);
+
                         if (doc.HasMember("preset") && doc["preset"].IsString()) {
                             std::string presetName = doc["preset"].GetString();
                             if (presetCache.find(presetName) != presetCache.end()) {
-                                Manager::ApplyNPCCustomizationFromJSON(targetNPC, presetCache[presetName]);
-                                countNPCsModificados++;
+                                selectedPreset =
+                                    std::addressof(presetCache[presetName]);
+                                LoadFieldSourcesFromPreset(
+                                    *selectedPreset,
+                                    sources);
                             }
                         }
-                        else {
-                            Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
-                            countNPCsModificados++;
-                        }
+                        rapidjson::Document effective;
+                        BuildEffectiveNPCDocument(
+                            original,
+                            edited,
+                            *selectedPreset,
+                            sources,
+                            effective);
+                        Manager::ApplyNPCCustomizationFromJSON(
+                            targetNPC,
+                            effective);
+                        Manager::GetSingleton()->RegisterAffectedNPC(
+                            targetNPC->GetFormID(),
+                            "");
+                        countNPCsModificados++;
                     }
                 }
                 catch (...) { if (fp) fclose(fp); }
@@ -1576,7 +2491,7 @@ void NSettings::MmRegister() {
         // Carrega o idioma no momento do Registro do menu!
         LoadLanguage();
 
-        SKSEMenuFramework::SetSection("NPC Stats Editor");
+        SKSEMenuFramework::SetSection(GetLoc("menu.section", "NPC Stats Editor"));
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.editor", "Editor"), NPCMenu);
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.presets", "Presets"), Presets);
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.database", "Database"), NPCList);

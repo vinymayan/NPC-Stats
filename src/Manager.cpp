@@ -73,6 +73,48 @@ void Manager::PopulateAllLists() {
     _readyCallbacks.clear();
 }
 
+void Manager::RefreshLists(std::string_view a_signatures) {
+    const auto includes = [a_signatures](std::string_view a_signature) {
+        const auto equalsIgnoreCase = [](std::string_view a_left, std::string_view a_right) {
+            if (a_left.size() != a_right.size()) return false;
+
+            for (std::size_t i = 0; i < a_left.size(); ++i) {
+                const auto toUpperASCII = [](char a_character) {
+                    return a_character >= 'a' && a_character <= 'z' ?
+                        static_cast<char>(a_character - ('a' - 'A')) :
+                        a_character;
+                };
+                if (toUpperASCII(a_left[i]) != toUpperASCII(a_right[i])) return false;
+            }
+            return true;
+        };
+
+        std::size_t begin = 0;
+        while (begin <= a_signatures.size()) {
+            const auto end = a_signatures.find(',', begin);
+            auto token = a_signatures.substr(begin, end == std::string_view::npos ? a_signatures.size() - begin : end - begin);
+            while (!token.empty() && token.front() == ' ') token.remove_prefix(1);
+            while (!token.empty() && token.back() == ' ') token.remove_suffix(1);
+            if (equalsIgnoreCase(token, a_signature)) return true;
+            if (end == std::string_view::npos) break;
+            begin = end + 1;
+        }
+        return false;
+    };
+
+    if (a_signatures.empty() || includes("All")) {
+        _isPopulated = false;
+        PopulateAllLists();
+        return;
+    }
+    if (includes("NPC_")) PopulateList<RE::TESNPC>("NPC");
+    if (includes("CLAS")) PopulateList<RE::TESClass>("Class");
+    if (includes("CSTY")) PopulateList<RE::TESCombatStyle>("CombatStyle");
+    if (includes("PERK")) PopulateList<RE::BGSPerk>("Perk");
+    if (includes("FACT")) PopulateList<RE::TESFaction>("Faction");
+    if (includes("SPEL")) PopulateList<RE::SpellItem>("Spell");
+}
+
 const std::vector<InternalFormInfo>& Manager::GetList(const std::string& typeName) {
     static std::vector<InternalFormInfo> empty;
     auto it = _dataStore.find(typeName);
@@ -212,8 +254,264 @@ bool Manager::IsNPCAffected(RE::FormID baseID) {
     return false;
 }
 
+Manager::NPCCollectionState& Manager::GetOrCaptureCollectionState(RE::TESNPC* a_npc) {
+    auto& state = _npcCollectionStates[a_npc->GetFormID()];
+    if (state.captured) return state;
+
+    for (std::uint32_t i = 0; i < a_npc->perkCount; i++) {
+        if (a_npc->perks && a_npc->perks[i].perk) {
+            state.basePerks[a_npc->perks[i].perk] = a_npc->perks[i].currentRank;
+        }
+    }
+
+    for (const auto& factionRank : a_npc->factions) {
+        if (factionRank.faction) {
+            state.baseFactions[factionRank.faction] = factionRank.rank;
+        }
+    }
+
+    auto spellList = static_cast<RE::TESSpellList*>(a_npc);
+    if (spellList->actorEffects) {
+        for (std::uint32_t i = 0; i < spellList->actorEffects->numSpells; i++) {
+            if (spellList->actorEffects->spells && spellList->actorEffects->spells[i]) {
+                state.baseSpells.insert(spellList->actorEffects->spells[i]);
+            }
+        }
+    }
+
+    state.captured = true;
+    return state;
+}
+
+Manager::CollectionMode Manager::GetCollectionMode(
+    const rapidjson::Document& a_doc,
+    const char* a_modeMember,
+    const char* a_collectionMember) {
+    if (a_doc.HasMember(a_modeMember) && a_doc[a_modeMember].IsString()) {
+        const std::string_view mode = a_doc[a_modeMember].GetString();
+        if (mode == "inherit") return CollectionMode::kInherit;
+        if (mode == "replaceBase") return CollectionMode::kReplaceBase;
+    }
+
+    // Legacy presets did not have an explicit mode. A populated array keeps its
+    // former intent, while an empty array is treated as "do not touch" to avoid
+    // destructive upgrades.
+    if (a_doc.HasMember(a_collectionMember) &&
+        a_doc[a_collectionMember].IsArray() &&
+        !a_doc[a_collectionMember].Empty()) {
+        return CollectionMode::kReplaceBase;
+    }
+
+    return CollectionMode::kUnspecified;
+}
+
+void Manager::ReconcilePerks(
+    RE::TESNPC* a_npc,
+    const rapidjson::Document& a_doc,
+    NPCCollectionState& a_state) {
+    const auto mode = GetCollectionMode(a_doc, "perksMode", "perks");
+    if (mode == CollectionMode::kUnspecified) return;
+    if (mode == CollectionMode::kInherit && !a_state.perksManaged) return;
+
+    std::map<RE::BGSPerk*, std::int8_t> desired;
+    if (mode == CollectionMode::kInherit) {
+        desired = a_state.basePerks;
+    }
+    else if (a_doc.HasMember("perks") && a_doc["perks"].IsArray()) {
+        for (const auto& entry : a_doc["perks"].GetArray()) {
+            if (!entry.IsObject() ||
+                !entry.HasMember("form") || !entry["form"].IsString() ||
+                !entry.HasMember("rank") || !entry["rank"].IsInt()) {
+                continue;
+            }
+
+            if (auto perk = RE::TESForm::LookupByID<RE::BGSPerk>(
+                    FormUtil::FormIDFromString(entry["form"].GetString()))) {
+                desired[perk] = static_cast<std::int8_t>(entry["rank"].GetInt());
+            }
+        }
+    }
+
+    std::set<RE::BGSPerk*> owned;
+    for (const auto& [perk, rank] : a_state.basePerks) {
+        (void)rank;
+        owned.insert(perk);
+    }
+    for (const auto& [perk, rank] : a_state.appliedPerks) {
+        (void)rank;
+        owned.insert(perk);
+    }
+
+    std::vector<RE::BGSPerk*> toRemove;
+    for (std::uint32_t i = 0; i < a_npc->perkCount; i++) {
+        auto* perk = a_npc->perks ? a_npc->perks[i].perk : nullptr;
+        if (perk && owned.contains(perk) && !desired.contains(perk)) {
+            toRemove.push_back(perk);
+        }
+    }
+    if (!toRemove.empty()) {
+        a_npc->RemovePerks(toRemove);
+    }
+
+    for (const auto& [perk, rank] : desired) {
+        bool found = false;
+        for (std::uint32_t i = 0; i < a_npc->perkCount; i++) {
+            if (a_npc->perks && a_npc->perks[i].perk == perk) {
+                a_npc->perks[i].currentRank = rank;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            a_npc->AddPerk(perk, rank);
+        }
+    }
+
+    if (mode == CollectionMode::kReplaceBase) {
+        a_state.appliedPerks = std::move(desired);
+        a_state.perksManaged = true;
+    }
+    else {
+        a_state.appliedPerks.clear();
+        a_state.perksManaged = false;
+    }
+}
+
+void Manager::ReconcileFactions(
+    RE::TESNPC* a_npc,
+    const rapidjson::Document& a_doc,
+    NPCCollectionState& a_state) {
+    const auto mode = GetCollectionMode(a_doc, "factionsMode", "factions");
+    if (mode == CollectionMode::kUnspecified) return;
+    if (mode == CollectionMode::kInherit && !a_state.factionsManaged) return;
+
+    std::map<RE::TESFaction*, std::int8_t> desired;
+    if (mode == CollectionMode::kInherit) {
+        desired = a_state.baseFactions;
+    }
+    else if (a_doc.HasMember("factions") && a_doc["factions"].IsArray()) {
+        for (const auto& entry : a_doc["factions"].GetArray()) {
+            if (!entry.IsObject() ||
+                !entry.HasMember("form") || !entry["form"].IsString() ||
+                !entry.HasMember("rank") || !entry["rank"].IsInt()) {
+                continue;
+            }
+
+            if (auto faction = RE::TESForm::LookupByID<RE::TESFaction>(
+                    FormUtil::FormIDFromString(entry["form"].GetString()))) {
+                desired[faction] = static_cast<std::int8_t>(entry["rank"].GetInt());
+            }
+        }
+    }
+
+    std::set<RE::TESFaction*> owned;
+    for (const auto& [faction, rank] : a_state.baseFactions) {
+        (void)rank;
+        owned.insert(faction);
+    }
+    for (const auto& [faction, rank] : a_state.appliedFactions) {
+        (void)rank;
+        owned.insert(faction);
+    }
+
+    for (auto it = a_npc->factions.begin(); it != a_npc->factions.end();) {
+        if (it->faction && owned.contains(it->faction) && !desired.contains(it->faction)) {
+            it = a_npc->factions.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    for (const auto& [faction, rank] : desired) {
+        auto current = std::find_if(
+            a_npc->factions.begin(),
+            a_npc->factions.end(),
+            [faction](const auto& entry) { return entry.faction == faction; });
+        if (current != a_npc->factions.end()) {
+            current->rank = rank;
+        }
+        else {
+            RE::FACTION_RANK entry;
+            entry.faction = faction;
+            entry.rank = rank;
+            a_npc->factions.push_back(entry);
+        }
+    }
+
+    if (mode == CollectionMode::kReplaceBase) {
+        a_state.appliedFactions = std::move(desired);
+        a_state.factionsManaged = true;
+    }
+    else {
+        a_state.appliedFactions.clear();
+        a_state.factionsManaged = false;
+    }
+}
+
+void Manager::ReconcileSpells(
+    RE::TESNPC* a_npc,
+    const rapidjson::Document& a_doc,
+    NPCCollectionState& a_state) {
+    const auto mode = GetCollectionMode(a_doc, "spellsMode", "spells");
+    if (mode == CollectionMode::kUnspecified) return;
+    if (mode == CollectionMode::kInherit && !a_state.spellsManaged) return;
+
+    std::set<RE::SpellItem*> desired;
+    if (mode == CollectionMode::kInherit) {
+        desired = a_state.baseSpells;
+    }
+    else if (a_doc.HasMember("spells") && a_doc["spells"].IsArray()) {
+        for (const auto& entry : a_doc["spells"].GetArray()) {
+            if (!entry.IsString()) continue;
+            if (auto spell = RE::TESForm::LookupByID<RE::SpellItem>(
+                    FormUtil::FormIDFromString(entry.GetString()))) {
+                desired.insert(spell);
+            }
+        }
+    }
+
+    std::set<RE::SpellItem*> owned = a_state.baseSpells;
+    owned.insert(a_state.appliedSpells.begin(), a_state.appliedSpells.end());
+
+    auto spellList = static_cast<RE::TESSpellList*>(a_npc);
+    if (spellList->actorEffects) {
+        std::vector<RE::SpellItem*> toRemove;
+        for (std::uint32_t i = 0; i < spellList->actorEffects->numSpells; i++) {
+            auto* spell = spellList->actorEffects->spells ? spellList->actorEffects->spells[i] : nullptr;
+            if (spell && owned.contains(spell) && !desired.contains(spell)) {
+                toRemove.push_back(spell);
+            }
+        }
+        if (!toRemove.empty()) {
+            spellList->actorEffects->RemoveSpells(toRemove);
+        }
+    }
+
+    if (!desired.empty() && !spellList->actorEffects) {
+        spellList->actorEffects = new RE::TESSpellList::SpellData();
+    }
+    if (spellList->actorEffects) {
+        for (auto* spell : desired) {
+            spellList->actorEffects->AddSpell(spell);
+        }
+    }
+
+    if (mode == CollectionMode::kReplaceBase) {
+        a_state.appliedSpells = std::move(desired);
+        a_state.spellsManaged = true;
+    }
+    else {
+        a_state.appliedSpells.clear();
+        a_state.spellsManaged = false;
+    }
+}
+
 void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::Document& doc) {
     if (!a_npc || !doc.IsObject()) return;
+
+    auto* manager = GetSingleton();
+    auto& collectionState = manager->GetOrCaptureCollectionState(a_npc);
 
     // --- Atributos base ---
     if (doc.HasMember("health") && doc["health"].IsFloat()) a_npc->playerSkills.health = static_cast<std::uint16_t>(doc["health"].GetFloat());
@@ -263,68 +561,12 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::
         }
     }
 
-    // --- Factions ---
-    if (doc.HasMember("factions") && doc["factions"].IsArray()) {
-        a_npc->factions.clear();
-        for (auto& f : doc["factions"].GetArray()) {
-            if (f.HasMember("form") && f.HasMember("rank")) {
-                if (auto fac = RE::TESForm::LookupByID<RE::TESFaction>(FormUtil::FormIDFromString(f["form"].GetString()))) {
-                    RE::FACTION_RANK fr;
-                    fr.faction = fac;
-                    fr.rank = static_cast<int8_t>(f["rank"].GetInt());
-                    a_npc->factions.push_back(fr);
-                }
-            }
-        }
-    }
-
-    // --- Perks ---
-    if (doc.HasMember("perks") && doc["perks"].IsArray()) {
-        std::vector<RE::BGSPerk*> toRemove;
-        for (std::uint32_t i = 0; i < a_npc->perkCount; i++) {
-            if (a_npc->perks && a_npc->perks[i].perk) toRemove.push_back(a_npc->perks[i].perk);
-        }
-        a_npc->RemovePerks(toRemove);
-
-        for (auto& p : doc["perks"].GetArray()) {
-            if (p.HasMember("form") && p.HasMember("rank")) {
-                if (auto perk = RE::TESForm::LookupByID<RE::BGSPerk>(FormUtil::FormIDFromString(p["form"].GetString()))) {
-                    a_npc->AddPerk(perk, static_cast<int8_t>(p["rank"].GetInt()));
-                }
-            }
-        }
-    }
-
-    // --- Spells (Correção via TESSpellList / actorEffects) ---
-    if (doc.HasMember("spells") && doc["spells"].IsArray()) {
-        auto spellComp = static_cast<RE::TESSpellList*>(a_npc);
-
-        // Remove os feitiços existentes da base Vacnilla
-        if (spellComp->actorEffects) {
-            std::vector<RE::SpellItem*> toRemove;
-            for (std::uint32_t i = 0; i < spellComp->actorEffects->numSpells; i++) {
-                if (spellComp->actorEffects->spells && spellComp->actorEffects->spells[i]) {
-                    toRemove.push_back(spellComp->actorEffects->spells[i]);
-                }
-            }
-            for (auto* sp : toRemove) {
-                spellComp->actorEffects->RemoveSpell(sp);
-            }
-        }
-
-        auto spellArray = doc["spells"].GetArray();
-        if (spellArray.Size() > 0) {
-            if (!spellComp->actorEffects) {
-                spellComp->actorEffects = new RE::TESSpellList::SpellData();
-            }
-
-            for (auto& s : spellArray) {
-                if (auto sp = RE::TESForm::LookupByID<RE::SpellItem>(FormUtil::FormIDFromString(s.GetString()))) {
-                    spellComp->actorEffects->AddSpell(sp);
-                }
-            }
-        }
-    }
+    // Collections use an ownership-aware reconciliation. Entries that were not
+    // present in the captured base state and were not applied by this plugin are
+    // considered external and are preserved.
+    manager->ReconcileFactions(a_npc, doc, collectionState);
+    manager->ReconcilePerks(a_npc, doc, collectionState);
+    manager->ReconcileSpells(a_npc, doc, collectionState);
 }
 
 void Manager::ApplyActorCustomizationFromJSON(RE::Actor* a_actor, const rapidjson::Document& doc) {
