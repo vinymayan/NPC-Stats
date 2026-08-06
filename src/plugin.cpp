@@ -6,6 +6,23 @@
 namespace
 {
     bool hasDFG = false;
+    bool dataLoaded = false;
+    bool dfgLoaded = false;
+    bool settingsLoaded = false;
+
+    void TryLoadSettings()
+    {
+        if (settingsLoaded || !dataLoaded) {
+            return;
+        }
+        if (hasDFG && !dfgLoaded) {
+            logger::info("[Plugin] Waiting for Dynamic Forms Generator before loading NPC settings.");
+            return;
+        }
+
+        NSettings::Load();
+        settingsLoaded = true;
+    }
 
     class DynamicFormsGeneratorListener : public RE::BSTEventSink<SKSE::ModCallbackEvent>
     {
@@ -31,7 +48,9 @@ namespace
 
             const std::string_view eventName = a_event->eventName.c_str();
             if (eventName == "DynamicFormsGeneratorLoaded") {
+                dfgLoaded = true;
                 Manager::GetSingleton()->PopulateAllLists();
+                TryLoadSettings();
                 return RE::BSEventNotifyControl::kContinue;
             }
 
@@ -53,12 +72,13 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
         }
     }
     if (message->type == SKSE::MessagingInterface::kDataLoaded) {
-        logger::info("[Plugin] Data loaded. Initializing NPC Stats Replacer...");
+        logger::info("[Plugin] Data loaded. Initializing NPC Stats Replacer");
+        dataLoaded = true;
         NSettings::MmRegister();
         if (!hasDFG) {
             Manager::GetSingleton()->PopulateAllLists();
         }
-        NSettings::Load();
+        TryLoadSettings();
 		Load3DHook::Install();
     }
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
