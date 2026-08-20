@@ -237,23 +237,6 @@ void Manager::PopulateList(const std::string& a_typeName, std::function<bool(T*)
 
 
 
-void Manager::RegisterAffectedNPC(RE::FormID baseID, const std::string& nifPath) {
-    _affectedNPCs[baseID] = nifPath;
-}
-
-void Manager::UnregisterAffectedNPC(RE::FormID baseID) {
-    _affectedNPCs.erase(baseID);
-}
-
-bool Manager::IsNPCAffected(RE::FormID baseID) {
-    auto it = _affectedNPCs.find(baseID);
-    if (it != _affectedNPCs.end()) {
-
-        return true;
-    }
-    return false;
-}
-
 Manager::NPCCollectionState& Manager::GetOrCaptureCollectionState(RE::TESNPC* a_npc) {
     auto& state = _npcCollectionStates[a_npc->GetFormID()];
     if (state.captured) return state;
@@ -584,44 +567,79 @@ void Manager::ApplyActorCustomizationFromJSON(RE::Actor* a_actor, const rapidjso
         avOwner->SetActorValue(RE::ActorValue::kStaminaRateMult, doc["staminaRateMult"].GetFloat());
 }
 
-void Manager::LoadAndApplyActorCustomizations(RE::Actor* a_actor) {
-    if (!a_actor) return;
-    auto base = a_actor->GetActorBase();
-    if (!base) return;
-
-    std::string editorID = clib_util::editorID::get_editorID(base);
-    if (editorID.empty()) editorID = std::format("{:08X}", base->GetFormID());
-
-    std::string npcPath = std::format("Data/SKSE/Plugins/NPC Stats/NPC/{}.json", editorID);
-    if (!std::filesystem::exists(npcPath)) return;
-
-    FILE* fp = nullptr;
-    fopen_s(&fp, npcPath.c_str(), "rb");
-    if (!fp) return;
-
-    char readBuffer[2048];
-    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-    rapidjson::Document doc;
-    doc.ParseStream(is);
-    fclose(fp);
-
-    if (!doc.IsObject()) return;
-
-    // Verifica se ele tem um preset lincado
-    if (doc.HasMember("preset") && doc["preset"].IsString()) {
-        std::string presetPath = std::format("Data/SKSE/Plugins/NPC Stats/Presets/{}.json", doc["preset"].GetString());
-        FILE* pFp = nullptr;
-        fopen_s(&pFp, presetPath.c_str(), "rb");
-        if (pFp) {
-            char pReadBuffer[2048];
-            rapidjson::FileReadStream pIs(pFp, pReadBuffer, sizeof(pReadBuffer));
-            rapidjson::Document pDoc;
-            pDoc.ParseStream(pIs);
-            fclose(pFp);
-            ApplyActorCustomizationFromJSON(a_actor, pDoc);
-        }
+void Manager::CacheActorCustomization(
+    RE::FormID baseID,
+    const rapidjson::Document& doc) {
+    if (!doc.IsObject()) {
+        RemoveActorCustomization(baseID);
+        return;
     }
-    else {
-        ApplyActorCustomizationFromJSON(a_actor, doc);
+
+    ActorRuntimeValues values;
+    bool hasRuntimeValues = false;
+    const auto readValue =
+        [&doc, &hasRuntimeValues](
+            const char* member,
+            float& destination) {
+            if (!doc.HasMember(member) ||
+                !doc[member].IsNumber()) {
+                return;
+            }
+            destination = doc[member].GetFloat();
+            hasRuntimeValues = true;
+        };
+
+    readValue("attackDamageMult", values.attackDamageMult);
+    readValue("healRateMult", values.healRateMult);
+    readValue("magickaRateMult", values.magickaRateMult);
+    readValue("staminaRateMult", values.staminaRateMult);
+
+    if (!hasRuntimeValues) {
+        RemoveActorCustomization(baseID);
+        return;
     }
+
+    _actorRuntimeValues[baseID] = values;
+}
+
+void Manager::RemoveActorCustomization(RE::FormID baseID) {
+    _actorRuntimeValues.erase(baseID);
+}
+
+bool Manager::ApplyCachedActorCustomization(RE::Actor* actor) {
+    if (!actor) return false;
+    auto* base = actor->GetActorBase();
+    if (!base) return false;
+
+    const auto values =
+        _actorRuntimeValues.find(base->GetFormID());
+    if (values == _actorRuntimeValues.end()) return false;
+
+    auto* actorValueOwner = actor->AsActorValueOwner();
+    if (!actorValueOwner) return false;
+
+    actorValueOwner->SetActorValue(
+        RE::ActorValue::kAttackDamageMult,
+        values->second.attackDamageMult);
+    actorValueOwner->SetActorValue(
+        RE::ActorValue::kHealRateMult,
+        values->second.healRateMult);
+    actorValueOwner->SetActorValue(
+        RE::ActorValue::kMagickaRateMult,
+        values->second.magickaRateMult);
+    actorValueOwner->SetActorValue(
+        RE::ActorValue::kStaminaRateMult,
+        values->second.staminaRateMult);
+    return true;
+}
+
+void Manager::ApplyCachedActorCustomizationsToLoadedActors() {
+    auto* processLists = RE::ProcessLists::GetSingleton();
+    if (!processLists) return;
+
+    processLists->ForAllActors(
+        [this](RE::Actor* actor) {
+            ApplyCachedActorCustomization(actor);
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
 }

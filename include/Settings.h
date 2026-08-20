@@ -24,5 +24,4 @@ namespace NSettings {
     void MmRegister();
     void Load();
     void Save();
-    void LoadAndApplyActorCustomizations(RE::Actor* actor);
 }

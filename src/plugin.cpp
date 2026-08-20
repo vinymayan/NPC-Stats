@@ -79,7 +79,7 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
             Manager::GetSingleton()->PopulateAllLists();
         }
         TryLoadSettings();
-		Load3DHook::Install();
+        ActorLoadEventHandler::GetSingleton()->Register();
     }
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
     }

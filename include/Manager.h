@@ -11,8 +11,6 @@
 #include "rapidjson/filewritestream.h"
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
-#include <thread>
-#include <chrono>
 
 namespace FormUtil {
     const RE::TESFile* GetMasterFile(RE::TESForm* ref);
@@ -47,10 +45,6 @@ public:
         return &singleton;
     }
 
-    void RegisterAffectedNPC(RE::FormID baseID, const std::string& nifPath);
-    void UnregisterAffectedNPC(RE::FormID baseID);
-    bool IsNPCAffected(RE::FormID baseID);
-
     void PopulateAllLists();
     void RefreshLists(std::string_view a_signatures);
     static std::string ToUTF8(std::string_view a_str);
@@ -62,7 +56,10 @@ public:
     void RegisterReadyCallback(std::function<void()> callback);
     static void ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::Document& doc);
     static void ApplyActorCustomizationFromJSON(RE::Actor* a_actor, const rapidjson::Document& doc);
-    void LoadAndApplyActorCustomizations(RE::Actor* a_actor);
+    void CacheActorCustomization(RE::FormID baseID, const rapidjson::Document& doc);
+    void RemoveActorCustomization(RE::FormID baseID);
+    bool ApplyCachedActorCustomization(RE::Actor* actor);
+    void ApplyCachedActorCustomizationsToLoadedActors();
 
     bool _isPopulated = false;
 
@@ -89,6 +86,13 @@ private:
         bool spellsManaged = false;
     };
 
+    struct ActorRuntimeValues {
+        float attackDamageMult = 1.0f;
+        float healRateMult = 100.0f;
+        float magickaRateMult = 100.0f;
+        float staminaRateMult = 100.0f;
+    };
+
     Manager() = default;
 
     template <typename T>
@@ -105,7 +109,7 @@ private:
 
     std::map<std::string, std::vector<InternalFormInfo>> _dataStore;
     std::vector<std::function<void()>> _readyCallbacks;
-    std::map<RE::FormID, std::string> _affectedNPCs;
     std::map<RE::FormID, NPCCollectionState> _npcCollectionStates;
+    std::map<RE::FormID, ActorRuntimeValues> _actorRuntimeValues;
 };
 

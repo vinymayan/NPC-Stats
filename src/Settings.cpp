@@ -136,6 +136,10 @@ static rapidjson::Document g_activePresetState;
 static std::map<RE::FormID, std::string> g_vanillaNPCStates;
 static std::string g_lastSavedStateStr = "";
 static std::string g_lastSavedPresetLink = "";
+static std::set<std::string> g_explicitNPCCollectionEdits;
+static bool g_loadedNPCNeedsMigration = false;
+
+constexpr int kCurrentSchemaVersion = 2;
 
 enum class FieldSource {
     kOriginal = 0,
@@ -191,6 +195,133 @@ bool ShouldManageCollection(
     return doc.HasMember(collectionMember) &&
            doc[collectionMember].IsArray() &&
            !doc[collectionMember].Empty();
+}
+
+bool IsCollectionGroup(std::string_view groupKey) {
+    return groupKey == "perks" ||
+           groupKey == "factions" ||
+           groupKey == "spells";
+}
+
+bool UsesCurrentSchema(const rapidjson::Document& document) {
+    return document.IsObject() &&
+           document.HasMember("schemaVersion") &&
+           document["schemaVersion"].IsInt() &&
+           document["schemaVersion"].GetInt() >= kCurrentSchemaVersion;
+}
+
+std::set<std::string> ReadExplicitCollectionEdits(
+    const rapidjson::Document& document) {
+    std::set<std::string> groups;
+    if (!UsesCurrentSchema(document) ||
+        !document.HasMember("editedGroups") ||
+        !document["editedGroups"].IsArray()) {
+        return groups;
+    }
+
+    for (const auto& entry : document["editedGroups"].GetArray()) {
+        if (!entry.IsString()) continue;
+        const std::string_view groupKey = entry.GetString();
+        if (IsCollectionGroup(groupKey)) {
+            groups.emplace(groupKey);
+        }
+    }
+    return groups;
+}
+
+bool IsCollectionExplicitlyEdited(
+    const rapidjson::Document& document,
+    std::string_view groupKey) {
+    if (!IsCollectionGroup(groupKey)) return true;
+    const auto groups = ReadExplicitCollectionEdits(document);
+    return groups.contains(std::string(groupKey));
+}
+
+void AddNPCSchemaMetadata(
+    rapidjson::Document& document,
+    const std::set<std::string>& explicitCollectionEdits) {
+    auto& allocator = document.GetAllocator();
+    if (document.HasMember("schemaVersion")) {
+        document.RemoveMember("schemaVersion");
+    }
+    document.AddMember("schemaVersion", kCurrentSchemaVersion, allocator);
+
+    if (document.HasMember("editedGroups")) {
+        document.RemoveMember("editedGroups");
+    }
+    rapidjson::Value editedGroups(rapidjson::kArrayType);
+    for (const auto& groupKey : explicitCollectionEdits) {
+        editedGroups.PushBack(
+            rapidjson::Value(groupKey.c_str(), allocator),
+            allocator);
+    }
+    document.AddMember("editedGroups", editedGroups, allocator);
+}
+
+void RemoveImplicitCollections(
+    rapidjson::Document& document,
+    const std::set<std::string>& explicitCollectionEdits) {
+    const auto removeCollection =
+        [&document, &explicitCollectionEdits](
+            const char* groupKey,
+            const char* modeMember,
+            const char* collectionMember) {
+            if (explicitCollectionEdits.contains(groupKey)) return;
+            if (document.HasMember(modeMember)) {
+                document.RemoveMember(modeMember);
+            }
+            if (document.HasMember(collectionMember)) {
+                document.RemoveMember(collectionMember);
+            }
+        };
+
+    removeCollection("perks", "perksMode", "perks");
+    removeCollection("factions", "factionsMode", "factions");
+    removeCollection("spells", "spellsMode", "spells");
+}
+
+bool HasNPCCustomizationData(const rapidjson::Document& document) {
+    if (!document.IsObject()) return false;
+
+    for (auto member = document.MemberBegin();
+         member != document.MemberEnd();
+         ++member) {
+        const std::string_view name = member->name.GetString();
+        if (name != "schemaVersion" &&
+            name != "editedGroups" &&
+            name != "fieldSources" &&
+            name != "preset") {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BackupLegacyNPCDocument(const std::string& path) {
+    if (!std::filesystem::exists(path)) return;
+
+    const std::filesystem::path backupPath =
+        std::filesystem::path(path).concat(".pre-schema-v2.bak");
+    if (std::filesystem::exists(backupPath)) return;
+
+    std::error_code error;
+    std::filesystem::copy_file(
+        path,
+        backupPath,
+        std::filesystem::copy_options::none,
+        error);
+    if (error) {
+        logger::warn(
+            "Could not back up legacy NPC JSON '{}': {}",
+            path,
+            error.message());
+    }
+}
+
+void MarkNPCCollectionExplicit(std::string_view groupKey) {
+    if (!isEditingPreset && IsCollectionGroup(groupKey)) {
+        g_explicitNPCCollectionEdits.emplace(groupKey);
+    }
 }
 
 const char* FieldSourceToString(FieldSource source) {
@@ -365,21 +496,21 @@ void LoadFieldSourcesFromPreset(
             sources[group.key] =
                 ShouldManageCollection(preset, "perksMode", "perks") ?
                 FieldSource::kPreset :
-                FieldSource::kEdited;
+                FieldSource::kOriginal;
             continue;
         }
         if (std::string_view(group.key) == "factions") {
             sources[group.key] =
                 ShouldManageCollection(preset, "factionsMode", "factions") ?
                 FieldSource::kPreset :
-                FieldSource::kEdited;
+                FieldSource::kOriginal;
             continue;
         }
         if (std::string_view(group.key) == "spells") {
             sources[group.key] =
                 ShouldManageCollection(preset, "spellsMode", "spells") ?
                 FieldSource::kPreset :
-                FieldSource::kEdited;
+                FieldSource::kOriginal;
             continue;
         }
 
@@ -440,7 +571,9 @@ void BuildEffectiveNPCDocument(
             return true;
         };
         const bool editedAvailable =
-            !isCollection || managesCollection(edited);
+            !isCollection ||
+            (IsCollectionExplicitlyEdited(edited, groupKey) &&
+             managesCollection(edited));
         const bool presetAvailable =
             !isCollection || managesCollection(preset);
 
@@ -685,6 +818,10 @@ void GenerateJSONFromUI(rapidjson::Document& doc, bool includeFieldSources = fal
 
     if (includeFieldSources) {
         AddFieldSourcesToJSON(doc);
+        doc.AddMember(
+            "schemaVersion",
+            kCurrentSchemaVersion,
+            allocator);
     }
 }
 
@@ -697,6 +834,10 @@ void UpdateNPCEditStateFromUI() {
         if (hasLinkedPreset && GetFieldSource(group.key) != FieldSource::kEdited) {
             continue;
         }
+        if (IsCollectionGroup(group.key) &&
+            !g_explicitNPCCollectionEdits.contains(group.key)) {
+            continue;
+        }
 
         for (const auto* member : group.members) {
             if (g_npcEditState.HasMember(member)) {
@@ -705,6 +846,13 @@ void UpdateNPCEditStateFromUI() {
             CopyJSONMember(g_npcEditState, uiDocument, member);
         }
     }
+
+    RemoveImplicitCollections(
+        g_npcEditState,
+        g_explicitNPCCollectionEdits);
+    AddNPCSchemaMetadata(
+        g_npcEditState,
+        g_explicitNPCCollectionEdits);
 }
 
 void ParseJSONToUI(const rapidjson::Document& j) {
@@ -792,6 +940,14 @@ void ParseJSONToUI(const rapidjson::Document& j) {
 void UpdateLastSavedState() {
     rapidjson::Document doc;
     GenerateJSONFromUI(doc, isEditingPreset);
+    if (!isEditingPreset) {
+        RemoveImplicitCollections(
+            doc,
+            g_explicitNPCCollectionEdits);
+        AddNPCSchemaMetadata(
+            doc,
+            g_explicitNPCCollectionEdits);
+    }
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
@@ -803,6 +959,14 @@ bool HasUnsavedChanges() {
     if (ui_linkedPreset != g_lastSavedPresetLink) return true;
     rapidjson::Document doc;
     GenerateJSONFromUI(doc, isEditingPreset);
+    if (!isEditingPreset) {
+        RemoveImplicitCollections(
+            doc,
+            g_explicitNPCCollectionEdits);
+        AddNPCSchemaMetadata(
+            doc,
+            g_explicitNPCCollectionEdits);
+    }
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
     doc.Accept(writer);
@@ -1013,6 +1177,8 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     activePresetName = "";
     ui_linkedPreset = "";
     SetAllFieldSources(FieldSource::kEdited);
+    g_explicitNPCCollectionEdits.clear();
+    g_loadedNPCNeedsMigration = false;
 
     g_originalNPCState.SetObject();
     g_originalNPCState.Parse(g_vanillaNPCStates[g_currentNPC->GetFormID()].c_str());
@@ -1027,6 +1193,10 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     if (std::filesystem::exists(filePath)) {
         rapidjson::Document storedNPC;
         if (ReadJSONDocument(filePath, storedNPC)) {
+            g_loadedNPCNeedsMigration =
+                !UsesCurrentSchema(storedNPC);
+            g_explicitNPCCollectionEdits =
+                ReadExplicitCollectionEdits(storedNPC);
             ExtractNPCEditDocument(storedNPC, g_npcEditState);
 
             if (storedNPC.HasMember("preset") && storedNPC["preset"].IsString()) {
@@ -1075,6 +1245,10 @@ void SaveData() {
         finalPath = std::format("{}/{}.json", NPCPath, editorID);
     }
 
+    if (!isEditingPreset && g_loadedNPCNeedsMigration) {
+        BackupLegacyNPCDocument(finalPath);
+    }
+
     FILE* fp = nullptr;
     fopen_s(&fp, finalPath.c_str(), "wb");
     if (fp) {
@@ -1086,9 +1260,16 @@ void SaveData() {
         logger::info("Stats saved to {}", finalPath);
 
         if (!isEditingPreset && g_currentNPC) {
-            Manager::GetSingleton()->RegisterAffectedNPC(
+            g_loadedNPCNeedsMigration = false;
+            rapidjson::Document effective;
+            BuildEffectiveNPCDocument(
+                g_originalNPCState,
+                g_npcEditState,
+                g_activePresetState,
+                effective);
+            Manager::GetSingleton()->CacheActorCustomization(
                 g_currentNPC->GetFormID(),
-                "");
+                effective);
         }
     }
 
@@ -1131,9 +1312,9 @@ void SaveData() {
                                 doc,
                                 effective);
                             Manager::ApplyNPCCustomizationFromJSON(targetNPC, effective);
-                            Manager::GetSingleton()->RegisterAffectedNPC(
+                            Manager::GetSingleton()->CacheActorCustomization(
                                 targetNPC->GetFormID(),
-                                "");
+                                effective);
                             if (g_presetReturnActor &&
                                 g_presetReturnActor->GetActorBase() == targetNPC) {
                                 Manager::ApplyActorCustomizationFromJSON(
@@ -1160,6 +1341,9 @@ void ApplyNPC() {
         g_activePresetState,
         effective);
     Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, effective);
+    Manager::GetSingleton()->CacheActorCustomization(
+        g_currentNPC->GetFormID(),
+        effective);
     ParseJSONToUI(effective);
 
     // Se houver um Ator carregado no mundo e a vida mudar, atualizamos instantaneamente
@@ -1187,8 +1371,6 @@ void ApplyNPC() {
                 avOwner->SetBaseActorValue(SkillToActorValue[i], ui_skills[i]);
             }
         }
-
-        g_currentActor->EvaluatePackage(false, true); // Força refresh da IA / stats
     }
 }
 
@@ -1208,7 +1390,7 @@ void RestoreDefaultNPC() {
 
     if (std::filesystem::exists(filePath)) std::filesystem::remove(filePath);
     ui_linkedPreset = "";
-    Manager::GetSingleton()->UnregisterAffectedNPC(
+    Manager::GetSingleton()->RemoveActorCustomization(
         g_currentNPC->GetFormID());
 
     if (g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
@@ -1220,7 +1402,6 @@ void RestoreDefaultNPC() {
         Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, originalEngineState);
     }
     LoadNPCToUI(g_currentNPC, g_currentActor);
-    if (g_currentActor) g_currentActor->EvaluatePackage(false, true);
 }
 
 void UnlinkPreset() {
@@ -1340,6 +1521,12 @@ void DrawMainEditorUI() {
                     bool backupEdit = isEditingPreset;
 
                     SetAllFieldSources(FieldSource::kPreset);
+                    ui_fieldSources["perks"] =
+                        FieldSource::kOriginal;
+                    ui_fieldSources["factions"] =
+                        FieldSource::kOriginal;
+                    ui_fieldSources["spells"] =
+                        FieldSource::kOriginal;
                     activePresetName = newPresetName;
                     isEditingPreset = true;
                     SaveData();
@@ -1585,12 +1772,20 @@ void DrawMainEditorUI() {
             }
             else {
                 ImGuiMCP::SetNextItemWidth(-1.0f);
-                ImGuiMCP::InputInt("##rank", &ui_perks[i].rank, 1);
+                if (ImGuiMCP::InputInt(
+                        "##rank",
+                        &ui_perks[i].rank,
+                        1)) {
+                    MarkNPCCollectionExplicit("perks");
+                }
             }
             ImGuiMCP::PopID();
         }
         ImGuiMCP::EndTable();
-        if (to_remove_perk != -1) ui_perks.erase(ui_perks.begin() + to_remove_perk);
+        if (to_remove_perk != -1) {
+            ui_perks.erase(ui_perks.begin() + to_remove_perk);
+            MarkNPCCollectionExplicit("perks");
+        }
     }
     if (perksEditable) {
         static RE::BGSPerk* newPerk = nullptr;
@@ -1601,7 +1796,10 @@ void DrawMainEditorUI() {
         if (ImGuiMCP::Button(addBtnStr.c_str()) && newPerk) {
             bool exists = false;
             for (const auto& p : ui_perks) { if (p.perk == newPerk) exists = true; }
-            if (!exists) ui_perks.push_back({ newPerk, 1 });
+            if (!exists) {
+                ui_perks.push_back({ newPerk, 1 });
+                MarkNPCCollectionExplicit("perks");
+            }
         }
     }
     ImGuiMCP::Separator();
@@ -1632,12 +1830,20 @@ void DrawMainEditorUI() {
             }
             else {
                 ImGuiMCP::SetNextItemWidth(-1.0f);
-                ImGuiMCP::InputInt("##rank", &ui_factions[i].rank, 1);
+                if (ImGuiMCP::InputInt(
+                        "##rank",
+                        &ui_factions[i].rank,
+                        1)) {
+                    MarkNPCCollectionExplicit("factions");
+                }
             }
             ImGuiMCP::PopID();
         }
         ImGuiMCP::EndTable();
-        if (to_remove_faction != -1) ui_factions.erase(ui_factions.begin() + to_remove_faction);
+        if (to_remove_faction != -1) {
+            ui_factions.erase(ui_factions.begin() + to_remove_faction);
+            MarkNPCCollectionExplicit("factions");
+        }
     }
     if (factionsEditable) {
         static RE::TESFaction* newFaction = nullptr;
@@ -1648,7 +1854,10 @@ void DrawMainEditorUI() {
         if (ImGuiMCP::Button(addFacBtnStr.c_str()) && newFaction) {
             bool exists = false;
             for (const auto& f : ui_factions) { if (f.faction == newFaction) exists = true; }
-            if (!exists) ui_factions.push_back({ newFaction, 0 });
+            if (!exists) {
+                ui_factions.push_back({ newFaction, 0 });
+                MarkNPCCollectionExplicit("factions");
+            }
         }
     }
 
@@ -1673,7 +1882,10 @@ void DrawMainEditorUI() {
             ImGuiMCP::PopID();
         }
         ImGuiMCP::EndTable();
-        if (to_remove_spell != -1) ui_spells.erase(ui_spells.begin() + to_remove_spell);
+        if (to_remove_spell != -1) {
+            ui_spells.erase(ui_spells.begin() + to_remove_spell);
+            MarkNPCCollectionExplicit("spells");
+        }
     }
     if (spellsEditable) {
         static RE::SpellItem* newSpell = nullptr;
@@ -1684,6 +1896,7 @@ void DrawMainEditorUI() {
         if (ImGuiMCP::Button(addSpellBtnStr.c_str()) && newSpell) {
             if (std::find(ui_spells.begin(), ui_spells.end(), newSpell) == ui_spells.end()) {
                 ui_spells.push_back(newSpell);
+                MarkNPCCollectionExplicit("spells");
             }
         }
     }
@@ -1951,9 +2164,21 @@ void NSettings::Presets() {
                     if (!ReadJSONDocument(npcPath, storedNPC)) {
                         storedNPC.SetObject();
                     }
+                    const bool needsMigration =
+                        !UsesCurrentSchema(storedNPC);
+                    const auto explicitCollectionEdits =
+                        ReadExplicitCollectionEdits(storedNPC);
                     if (storedNPC.HasMember("preset")) {
                         storedNPC.RemoveMember("preset");
                     }
+                    RemoveImplicitCollections(
+                        storedNPC,
+                        explicitCollectionEdits);
+                    const bool hasPersistentCustomization =
+                        HasNPCCustomizationData(storedNPC);
+                    AddNPCSchemaMetadata(
+                        storedNPC,
+                        explicitCollectionEdits);
 
                     EnsureOriginalNPCState(npc);
                     rapidjson::Document original;
@@ -1976,7 +2201,11 @@ void NSettings::Presets() {
                         effective);
 
                     bool persisted = false;
-                    if (storedNPC.MemberCount() == 0) {
+                    if (needsMigration &&
+                        std::filesystem::exists(npcPath)) {
+                        BackupLegacyNPCDocument(npcPath);
+                    }
+                    if (!hasPersistentCustomization) {
                         if (std::filesystem::exists(npcPath)) {
                             std::error_code error;
                             std::filesystem::remove(npcPath, error);
@@ -2008,14 +2237,14 @@ void NSettings::Presets() {
                             effective);
                     }
 
-                    if (storedNPC.MemberCount() == 0) {
-                        Manager::GetSingleton()->UnregisterAffectedNPC(
+                    if (!hasPersistentCustomization) {
+                        Manager::GetSingleton()->RemoveActorCustomization(
                             formID);
                     }
                     else {
-                        Manager::GetSingleton()->RegisterAffectedNPC(
+                        Manager::GetSingleton()->CacheActorCustomization(
                             formID,
-                            "");
+                            effective);
                     }
                 }
 
@@ -2039,6 +2268,16 @@ void NSettings::Presets() {
                     if (!ReadJSONDocument(npcPath, storedNPC)) {
                         storedNPC.SetObject();
                     }
+                    const bool needsMigration =
+                        !UsesCurrentSchema(storedNPC);
+                    const auto explicitCollectionEdits =
+                        ReadExplicitCollectionEdits(storedNPC);
+                    RemoveImplicitCollections(
+                        storedNPC,
+                        explicitCollectionEdits);
+                    AddNPCSchemaMetadata(
+                        storedNPC,
+                        explicitCollectionEdits);
                     if (storedNPC.HasMember("preset")) {
                         storedNPC.RemoveMember("preset");
                     }
@@ -2062,6 +2301,10 @@ void NSettings::Presets() {
                         presetSources,
                         effective);
 
+                    if (needsMigration &&
+                        std::filesystem::exists(npcPath)) {
+                        BackupLegacyNPCDocument(npcPath);
+                    }
                     if (!WriteJSONDocument(npcPath, storedNPC)) {
                         logger::error(
                             "Failed to link NPC {:08X} to preset '{}'.",
@@ -2078,9 +2321,9 @@ void NSettings::Presets() {
                             g_currentActor,
                             effective);
                     }
-                    Manager::GetSingleton()->RegisterAffectedNPC(
+                    Manager::GetSingleton()->CacheActorCustomization(
                         formID,
-                        "");
+                        effective);
                 }
 
                 if (g_currentNPC && !isEditingPreset) {
@@ -2135,7 +2378,20 @@ void NSettings::Presets() {
                     std::string nPath = std::format("{}/{}.json", NPCPath, u);
                     if (std::filesystem::exists(nPath)) std::filesystem::remove(nPath);
                     if (auto* npc = LookupNPCFromConfigName(u)) {
-                        Manager::GetSingleton()->UnregisterAffectedNPC(
+                        EnsureOriginalNPCState(npc);
+                        rapidjson::Document original;
+                        original.Parse(
+                            g_vanillaNPCStates[npc->GetFormID()].c_str());
+                        Manager::ApplyNPCCustomizationFromJSON(
+                            npc,
+                            original);
+                        if (g_currentActor &&
+                            g_currentActor->GetActorBase() == npc) {
+                            Manager::ApplyActorCustomizationFromJSON(
+                                g_currentActor,
+                                original);
+                        }
+                        Manager::GetSingleton()->RemoveActorCustomization(
                             npc->GetFormID());
                     }
                 }
@@ -2150,19 +2406,76 @@ void NSettings::Presets() {
                         continue;
                     }
 
+                    const bool needsMigration =
+                        !UsesCurrentSchema(npcDocument);
+                    const auto explicitCollectionEdits =
+                        ReadExplicitCollectionEdits(npcDocument);
                     npcDocument.RemoveMember("preset");
-                    FILE* npcFile = nullptr;
-                    fopen_s(&npcFile, nPath.c_str(), "wb");
-                    if (!npcFile) continue;
+                    RemoveImplicitCollections(
+                        npcDocument,
+                        explicitCollectionEdits);
+                    const bool hasPersistentCustomization =
+                        HasNPCCustomizationData(npcDocument);
+                    AddNPCSchemaMetadata(
+                        npcDocument,
+                        explicitCollectionEdits);
 
-                    char writeBuffer[65536];
-                    rapidjson::FileWriteStream output(
-                        npcFile,
-                        writeBuffer,
-                        sizeof(writeBuffer));
-                    rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(output);
-                    npcDocument.Accept(writer);
-                    fclose(npcFile);
+                    if (needsMigration) {
+                        BackupLegacyNPCDocument(nPath);
+                    }
+                    if (hasPersistentCustomization) {
+                        if (!WriteJSONDocument(nPath, npcDocument)) {
+                            continue;
+                        }
+                    }
+                    else {
+                        std::error_code error;
+                        std::filesystem::remove(nPath, error);
+                        if (error) continue;
+                    }
+
+                    auto* npc = LookupNPCFromConfigName(u);
+                    if (!npc) continue;
+                    EnsureOriginalNPCState(npc);
+
+                    rapidjson::Document original;
+                    original.Parse(
+                        g_vanillaNPCStates[npc->GetFormID()].c_str());
+                    rapidjson::Document edited;
+                    ExtractNPCEditDocument(npcDocument, edited);
+                    rapidjson::Document noPreset;
+                    noPreset.SetObject();
+                    FieldSourceMap editedSources;
+                    SetAllFieldSources(
+                        editedSources,
+                        FieldSource::kEdited);
+                    rapidjson::Document effective;
+                    BuildEffectiveNPCDocument(
+                        original,
+                        edited,
+                        noPreset,
+                        editedSources,
+                        effective);
+                    Manager::ApplyNPCCustomizationFromJSON(
+                        npc,
+                        effective);
+                    if (g_currentActor &&
+                        g_currentActor->GetActorBase() == npc) {
+                        Manager::ApplyActorCustomizationFromJSON(
+                            g_currentActor,
+                            effective);
+                    }
+                    if (hasPersistentCustomization) {
+                        Manager::GetSingleton()->
+                            CacheActorCustomization(
+                                npc->GetFormID(),
+                                effective);
+                    }
+                    else {
+                        Manager::GetSingleton()->
+                            RemoveActorCustomization(
+                                npc->GetFormID());
+                    }
                 }
             }
             if (activePresetName == presetToDelete) { activePresetName = ""; isEditingPreset = false; }
@@ -2340,53 +2653,6 @@ void NSettings::NPCMenu() {
     }
 }
 
-void NSettings::LoadAndApplyActorCustomizations(RE::Actor* actor) {
-    if (!actor) return;
-    auto* npc = actor->GetActorBase();
-    if (!npc) return;
-
-    std::string editorID = clib_util::editorID::get_editorID(npc);
-    if (editorID.empty()) editorID = std::format("{:08X}", npc->GetFormID());
-
-    const std::string npcPath = std::format("{}/{}.json", NPCPath, editorID);
-    rapidjson::Document storedNPC;
-    if (!ReadJSONDocument(npcPath, storedNPC)) return;
-
-    if (!g_vanillaNPCStates.contains(npc->GetFormID())) {
-        std::string originalJSON;
-        CaptureVanillaState(npc, originalJSON);
-        g_vanillaNPCStates[npc->GetFormID()] = originalJSON;
-    }
-
-    rapidjson::Document original;
-    original.Parse(g_vanillaNPCStates[npc->GetFormID()].c_str());
-    rapidjson::Document edited;
-    ExtractNPCEditDocument(storedNPC, edited);
-    rapidjson::Document preset;
-    preset.SetObject();
-
-    FieldSourceMap sources;
-    SetAllFieldSources(sources, FieldSource::kEdited);
-    if (storedNPC.HasMember("preset") && storedNPC["preset"].IsString()) {
-        const std::string presetPath = std::format(
-            "{}/{}.json",
-            PresetsPath,
-            storedNPC["preset"].GetString());
-        if (ReadJSONDocument(presetPath, preset)) {
-            LoadFieldSourcesFromPreset(preset, sources);
-        }
-    }
-
-    rapidjson::Document effective;
-    BuildEffectiveNPCDocument(
-        original,
-        edited,
-        preset,
-        sources,
-        effective);
-    Manager::ApplyActorCustomizationFromJSON(actor, effective);
-}
-
 void NSettings::Load() {
     logger::info("[Load] Inicializando sistema de arquivos de Stats...");
     std::filesystem::create_directories(NPCPath);
@@ -2441,6 +2707,26 @@ void NSettings::Load() {
                     fclose(fp);
 
                     if (doc.IsObject()) {
+                        if (!UsesCurrentSchema(doc)) {
+                            BackupLegacyNPCDocument(
+                                entry.path().string());
+                            const std::set<std::string>
+                                noExplicitCollectionEdits;
+                            RemoveImplicitCollections(
+                                doc,
+                                noExplicitCollectionEdits);
+                            AddNPCSchemaMetadata(
+                                doc,
+                                noExplicitCollectionEdits);
+                            if (!WriteJSONDocument(
+                                    entry.path().string(),
+                                    doc)) {
+                                logger::error(
+                                    "Failed to migrate legacy NPC JSON '{}'.",
+                                    entry.path().string());
+                            }
+                        }
+
                         rapidjson::Document original;
                         original.Parse(
                             g_vanillaNPCStates[targetNPC->GetFormID()].c_str());
@@ -2473,9 +2759,9 @@ void NSettings::Load() {
                         Manager::ApplyNPCCustomizationFromJSON(
                             targetNPC,
                             effective);
-                        Manager::GetSingleton()->RegisterAffectedNPC(
+                        Manager::GetSingleton()->CacheActorCustomization(
                             targetNPC->GetFormID(),
-                            "");
+                            effective);
                         countNPCsModificados++;
                     }
                 }
@@ -2483,6 +2769,8 @@ void NSettings::Load() {
             }
         }
     }
+    Manager::GetSingleton()->
+        ApplyCachedActorCustomizationsToLoadedActors();
     logger::info("[NPC Stats Replacer] BOOT CONCLUIDO: {} presets em cache, {} NPCs modificados.", countPresetsCarregados, countNPCsModificados);
 }
 
